@@ -43,18 +43,20 @@ jobs:
       - name: Build WASM
         run: wasm-pack build --target web --release
 
-      - name: Download sudachidict_small
+      - name: Download dictionaries
         run: |
-          curl -L https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/sudachi-dictionary-latest-small.zip \
-            -o dict.zip
-          unzip -j dict.zip '*/system_small.dic' -d .
+          for variant in small core full; do
+            curl -L "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/sudachi-dictionary-latest-${variant}.zip" \
+              -o dict.zip
+            unzip -j dict.zip "*/system_${variant}.dic" -d .
+          done
 
       - name: Assemble site
         run: |
           mkdir -p _site
           cp examples/browser/index.html _site/
           cp -r pkg _site/pkg
-          cp system_small.dic _site/system_small.dic
+          cp system_small.dic system_core.dic system_full.dic _site/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

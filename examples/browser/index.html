@@ -34,6 +34,8 @@
       background: #e8e8e8; color: #444;
     }
     .view-tab.active { background: #fff; border-bottom-color: #fff; font-weight: bold; color: #000; }
+    #furigana-style { display: none; }
+    .furigana-active #furigana-style { display: inline-block; }
   </style>
 </head>
 <body>
@@ -43,6 +45,11 @@
 
   <div class="controls">
     <input id="text" type="text" value="今日はいい天気ですね。" />
+    <select id="dict" title="Dictionary">
+      <option value="small">Small dict</option>
+      <option value="core" selected>Core dict</option>
+      <option value="full">Full dict</option>
+    </select>
     <select id="mode" title="Split mode">
       <option value="C" selected>C – named entity (longest)</option>
       <option value="B">B – word level</option>
@@ -54,6 +61,10 @@
   <div class="view-tabs" id="view-tabs" hidden>
     <span class="view-tab active" data-view="furigana">Furigana</span>
     <span class="view-tab" data-view="table">Morpheme table</span>
+    <select id="furigana-style" title="Furigana display style" style="margin-left:auto;font-size:.85rem;padding:.1rem .4rem;">
+      <option value="ruby">Ruby (HTML)</option>
+      <option value="text">Text: 漢字(よみ)</option>
+    </select>
   </div>
 
   <div id="furigana-box" hidden></div>
@@ -75,6 +86,10 @@
 
     let tokenizer;
 
+    // Cache for already-fetched dictionary bytes: variant → Uint8Array
+    const dictCache = new Map();
+    let loadedDictVariant = null;
+
     /** Convert katakana string to hiragana (for furigana display). */
     function katakanaToHiragana(str) {
       return str.replace(/[\u30A1-\u30F6]/g, ch =>
@@ -95,43 +110,78 @@
         .replace(/>/g, "&gt;");
     }
 
-    async function setup() {
-      // 1. Initialise the WASM module itself
-      await init();
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
 
-      // 2. Fetch the Sudachi system dictionary (sudachidict_small)
-      const resp = await fetch("system_small.dic");
-      if (!resp.ok) throw new Error(`Failed to fetch dictionary: ${resp.status}`);
-      const dictBytes = new Uint8Array(await resp.arrayBuffer());
+    /** Fetch a dictionary variant (cached). Returns Uint8Array. */
+    async function fetchDict(variant) {
+      if (dictCache.has(variant)) return dictCache.get(variant);
+      const resp = await fetch(`system_${variant}.dic`);
+      if (!resp.ok) throw new Error(`Failed to fetch system_${variant}.dic: ${resp.status}`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      dictCache.set(variant, bytes);
+      return bytes;
+    }
 
-      // 3. Build the tokenizer (this loads grammar + plugins inside WASM)
-      tokenizer = new Tokenizer(dictBytes);
-
-      document.getElementById("status").textContent = "✅ Ready";
+    /** Load (or switch to) a dictionary variant, rebuilding the tokenizer. */
+    async function loadDict(variant) {
+      if (loadedDictVariant === variant) return;
+      document.getElementById("btn").disabled = true;
+      const label = { small: "Small", core: "Core", full: "Full" }[variant];
+      setStatus(`⏳ Loading ${label} dictionary…`);
+      const bytes = await fetchDict(variant);
+      tokenizer = new Tokenizer(bytes);
+      loadedDictVariant = variant;
+      setStatus(`✅ Ready (${label} dictionary)`);
       document.getElementById("btn").disabled = false;
     }
 
+    async function setup() {
+      await init();
+      const initialVariant = document.getElementById("dict").value;
+      await loadDict(initialVariant);
+    }
+
+    // Reload tokenizer when dictionary selector changes
+    document.getElementById("dict").addEventListener("change", e => {
+      loadDict(e.target.value).catch(err => setStatus(`❌ ${err.message}`));
+    });
+
     // View tab switching
     let currentView = "furigana";
-    document.getElementById("view-tabs").addEventListener("click", e => {
+    const viewTabs = document.getElementById("view-tabs");
+    viewTabs.classList.add("furigana-active");
+    viewTabs.addEventListener("click", e => {
       const tab = e.target.closest(".view-tab");
       if (!tab) return;
       currentView = tab.dataset.view;
       document.querySelectorAll(".view-tab").forEach(t =>
         t.classList.toggle("active", t === tab)
       );
+      viewTabs.classList.toggle("furigana-active", currentView === "furigana");
       document.getElementById("furigana-box").hidden = (currentView !== "furigana");
       document.getElementById("tbl").hidden = (currentView !== "table");
     });
 
+    // Re-render furigana when style selector changes
+    let lastMorphemes = null;
+    document.getElementById("furigana-style").addEventListener("change", () => {
+      if (lastMorphemes) renderFurigana(lastMorphemes);
+    });
+
     function renderFurigana(morphemes) {
+      lastMorphemes = morphemes;
+      const style = document.getElementById("furigana-style").value;
       const html = morphemes.map(m => {
         const reading = katakanaToHiragana(m.readingForm);
         const surface = escapeHtml(m.surface);
-        // Only add ruby annotation if the surface contains kanji AND the reading
-        // differs from the surface itself (skip pure-kana morphemes).
         if (containsKanji(m.surface) && reading !== m.surface) {
-          return `<ruby>${surface}<rt>${escapeHtml(reading)}</rt></ruby>`;
+          if (style === "ruby") {
+            return `<ruby>${surface}<rt>${escapeHtml(reading)}</rt></ruby>`;
+          } else {
+            return `${surface}(${escapeHtml(reading)})`;
+          }
         }
         return surface;
       }).join("");
@@ -175,9 +225,7 @@
       if (e.key === "Enter") analyze();
     });
 
-    setup().catch(err => {
-      document.getElementById("status").textContent = `❌ ${err.message}`;
-    });
+    setup().catch(err => setStatus(`❌ ${err.message}`));
   </script>
 </body>
 </html>
