@@ -53,8 +53,8 @@
       // 1. Initialise the WASM module itself
       await init();
 
-      // 2. Fetch the Sudachi system dictionary (place system_core.dic next to index.html)
-      const resp = await fetch("system_core.dic");
+      // 2. Fetch the Sudachi system dictionary (sudachidict_small)
+      const resp = await fetch("system_small.dic");
       if (!resp.ok) throw new Error(`Failed to fetch dictionary: ${resp.status}`);
       const dictBytes = new Uint8Array(await resp.arrayBuffer());
 
