@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sudachi WASM – Browser Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+    h1   { font-size: 1.4rem; }
+    .controls { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
+    input[type=text] { flex: 1; font-size: 1rem; padding: .3rem .5rem; }
+    select, button   { font-size: 1rem; padding: .3rem .6rem; }
+    #status { color: #666; font-style: italic; margin-bottom: 1rem; }
+    table   { width: 100%; border-collapse: collapse; }
+    th, td  { border: 1px solid #ccc; padding: .35rem .6rem; text-align: left; }
+    th      { background: #f0f0f0; }
+    .pos    { font-size: .85rem; color: #555; }
+    .oov    { color: #c00; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Sudachi Japanese Morphological Analyzer (WASM)</h1>
+
+  <p id="status">⏳ Loading dictionary…</p>
+
+  <div class="controls">
+    <input id="text" type="text" value="今日はいい天気ですね。" />
+    <select id="mode" title="Split mode">
+      <option value="C" selected>C – named entity (longest)</option>
+      <option value="B">B – word level</option>
+      <option value="A">A – short units</option>
+    </select>
+    <button id="btn" disabled>Analyze</button>
+  </div>
+
+  <table id="tbl" hidden>
+    <thead>
+      <tr>
+        <th>#</th><th>Surface</th><th>Reading</th>
+        <th>Dictionary form</th><th>Normalized form</th>
+        <th>Part of speech</th><th>Offsets</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script type="module">
+    // wasm-pack build --target web  →  generates ./pkg/sudachi_wasm.js + .wasm
+    import init, { Tokenizer } from "./pkg/sudachi_wasm.js";
+
+    let tokenizer;
+
+    async function setup() {
+      // 1. Initialise the WASM module itself
+      await init();
+
+      // 2. Fetch the Sudachi system dictionary (place system_core.dic next to index.html)
+      const resp = await fetch("system_core.dic");
+      if (!resp.ok) throw new Error(`Failed to fetch dictionary: ${resp.status}`);
+      const dictBytes = new Uint8Array(await resp.arrayBuffer());
+
+      // 3. Build the tokenizer (this loads grammar + plugins inside WASM)
+      tokenizer = new Tokenizer(dictBytes);
+
+      document.getElementById("status").textContent = "✅ Ready";
+      document.getElementById("btn").disabled = false;
+    }
+
+    function analyze() {
+      const text = document.getElementById("text").value.trim();
+      const mode = document.getElementById("mode").value;
+      if (!text) return;
+
+      /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
+      const morphemes = tokenizer.tokenize(text, mode);
+
+      const tbody = document.querySelector("#tbl tbody");
+      tbody.innerHTML = "";
+      morphemes.forEach((m, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${i + 1}</td>
+          <td><b>${m.surface}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
+          <td>${m.readingForm}</td>
+          <td>${m.dictionaryForm}</td>
+          <td>${m.normalizedForm}</td>
+          <td class="pos">${m.partOfSpeech.join(" › ")}</td>
+          <td>[${m.begin}, ${m.end})</td>`;
+        tbody.appendChild(tr);
+      });
+
+      document.getElementById("tbl").hidden = false;
+    }
+
+    document.getElementById("btn").addEventListener("click", analyze);
+    document.getElementById("text").addEventListener("keydown", e => {
+      if (e.key === "Enter") analyze();
+    });
+
+    setup().catch(err => {
+      document.getElementById("status").textContent = `❌ ${err.message}`;
+    });
+  </script>
+</body>
+</html>
