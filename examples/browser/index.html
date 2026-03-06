@@ -15,6 +15,25 @@
     th      { background: #f0f0f0; }
     .pos    { font-size: .85rem; color: #555; }
     .oov    { color: #c00; font-weight: bold; }
+    /* Furigana output */
+    #furigana-box {
+      font-size: 1.6rem;
+      line-height: 3;
+      padding: .6rem .8rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: #fafafa;
+      margin-bottom: 1rem;
+    }
+    #furigana-box ruby { ruby-align: center; }
+    #furigana-box rt   { font-size: .5em; color: #444; }
+    .view-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; }
+    .view-tab {
+      font-size: .9rem; padding: .2rem .8rem; cursor: pointer;
+      border: 1px solid #ccc; border-radius: 4px 4px 0 0;
+      background: #e8e8e8; color: #444;
+    }
+    .view-tab.active { background: #fff; border-bottom-color: #fff; font-weight: bold; color: #000; }
   </style>
 </head>
 <body>
@@ -31,6 +50,13 @@
     </select>
     <button id="btn" disabled>Analyze</button>
   </div>
+
+  <div class="view-tabs" id="view-tabs" hidden>
+    <span class="view-tab active" data-view="furigana">Furigana</span>
+    <span class="view-tab" data-view="table">Morpheme table</span>
+  </div>
+
+  <div id="furigana-box" hidden></div>
 
   <table id="tbl" hidden>
     <thead>
@@ -49,6 +75,26 @@
 
     let tokenizer;
 
+    /** Convert katakana string to hiragana (for furigana display). */
+    function katakanaToHiragana(str) {
+      return str.replace(/[\u30A1-\u30F6]/g, ch =>
+        String.fromCharCode(ch.charCodeAt(0) - 0x60)
+      );
+    }
+
+    /** Return true if the string contains at least one kanji (CJK) character. */
+    function containsKanji(str) {
+      return /[\u3400-\u9FFF\uF900-\uFAFF]/.test(str);
+    }
+
+    /** Escape HTML special characters for safe insertion via innerHTML. */
+    function escapeHtml(str) {
+      return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
     async function setup() {
       // 1. Initialise the WASM module itself
       await init();
@@ -65,6 +111,52 @@
       document.getElementById("btn").disabled = false;
     }
 
+    // View tab switching
+    let currentView = "furigana";
+    document.getElementById("view-tabs").addEventListener("click", e => {
+      const tab = e.target.closest(".view-tab");
+      if (!tab) return;
+      currentView = tab.dataset.view;
+      document.querySelectorAll(".view-tab").forEach(t =>
+        t.classList.toggle("active", t === tab)
+      );
+      document.getElementById("furigana-box").hidden = (currentView !== "furigana");
+      document.getElementById("tbl").hidden = (currentView !== "table");
+    });
+
+    function renderFurigana(morphemes) {
+      const html = morphemes.map(m => {
+        const reading = katakanaToHiragana(m.readingForm);
+        const surface = escapeHtml(m.surface);
+        // Only add ruby annotation if the surface contains kanji AND the reading
+        // differs from the surface itself (skip pure-kana morphemes).
+        if (containsKanji(m.surface) && reading !== m.surface) {
+          return `<ruby>${surface}<rt>${escapeHtml(reading)}</rt></ruby>`;
+        }
+        return surface;
+      }).join("");
+      document.getElementById("furigana-box").innerHTML = html;
+      document.getElementById("furigana-box").hidden = (currentView !== "furigana");
+    }
+
+    function renderTable(morphemes) {
+      const tbody = document.querySelector("#tbl tbody");
+      tbody.innerHTML = "";
+      morphemes.forEach((m, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${i + 1}</td>
+          <td><b>${escapeHtml(m.surface)}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
+          <td>${escapeHtml(m.readingForm)}</td>
+          <td>${escapeHtml(m.dictionaryForm)}</td>
+          <td>${escapeHtml(m.normalizedForm)}</td>
+          <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
+          <td>[${m.begin}, ${m.end})</td>`;
+        tbody.appendChild(tr);
+      });
+      document.getElementById("tbl").hidden = (currentView !== "table");
+    }
+
     function analyze() {
       const text = document.getElementById("text").value.trim();
       const mode = document.getElementById("mode").value;
@@ -73,22 +165,9 @@
       /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
       const morphemes = tokenizer.tokenize(text, mode);
 
-      const tbody = document.querySelector("#tbl tbody");
-      tbody.innerHTML = "";
-      morphemes.forEach((m, i) => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${i + 1}</td>
-          <td><b>${m.surface}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
-          <td>${m.readingForm}</td>
-          <td>${m.dictionaryForm}</td>
-          <td>${m.normalizedForm}</td>
-          <td class="pos">${m.partOfSpeech.join(" › ")}</td>
-          <td>[${m.begin}, ${m.end})</td>`;
-        tbody.appendChild(tr);
-      });
-
-      document.getElementById("tbl").hidden = false;
+      renderFurigana(morphemes);
+      renderTable(morphemes);
+      document.getElementById("view-tabs").hidden = false;
     }
 
     document.getElementById("btn").addEventListener("click", analyze);
