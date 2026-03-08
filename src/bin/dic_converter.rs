@@ -85,11 +85,16 @@ fn parse_grammar(
 
 /// Compress the connection matrix into 64×64 zstd blocks.
 ///
+/// A zstd dictionary is trained from all blocks and stored in the output
+/// so the decompressor can use it for better small-block compression.
+///
 /// Output format:
 /// ```text
 /// [COMPRESSED_MAGIC: u32]
 /// [num_left: u16][num_right: u16]
 /// [num_blocks: u32]
+/// [dict_size: u32]
+/// [dictionary: u8 × dict_size]
 /// [block_index: (offset: u32, compressed_size: u32) × num_blocks]
 /// [compressed_block_data: ...]
 /// ```
@@ -103,8 +108,8 @@ fn compress_connection_matrix(
     let num_col_blocks = (num_left + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let num_blocks = num_row_blocks * num_col_blocks;
 
-    // Compress each block
-    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    // First pass: collect all raw blocks as samples for dictionary training
+    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
     for rb in 0..num_row_blocks {
         for cb in 0..num_col_blocks {
             let mut block_data = Vec::new();
@@ -115,10 +120,23 @@ fn compress_connection_matrix(
                     block_data.extend_from_slice(&buf[pos..pos + 2]);
                 }
             }
-            let compressed = zstd::bulk::compress(&block_data, 19)
-                .expect("zstd compression failed");
-            compressed_blocks.push(compressed);
+            samples.push(block_data);
         }
+    }
+
+    // Train dictionary from samples
+    let dict = zstd::dict::from_samples(&samples, 112 * 1024)
+        .expect("zstd dictionary training failed");
+    eprintln!("    Trained connection matrix dictionary: {} bytes", dict.len());
+
+    // Compress each block with the dictionary
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
+        .expect("failed to create compressor with dictionary");
+    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    for sample in &samples {
+        let compressed = compressor.compress(sample)
+            .expect("zstd compression failed");
+        compressed_blocks.push(compressed);
     }
 
     // Build output
@@ -127,6 +145,10 @@ fn compress_connection_matrix(
     result.extend_from_slice(&(num_left as u16).to_le_bytes());
     result.extend_from_slice(&(num_right as u16).to_le_bytes());
     result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+    // Dictionary
+    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    result.extend_from_slice(&dict);
 
     // Build block index
     let mut data_offset: u32 = 0;
@@ -256,12 +278,15 @@ const WI_BLOCK_SIZE: usize = 64;
 /// Block-compress word_info records.
 ///
 /// Groups N consecutive records into zstd-compressed blocks.
+/// A zstd dictionary is trained from all blocks for better compression.
 /// Output format:
 /// ```text
 /// [MAGIC: u32]
 /// [num_words: u32]
 /// [records_per_block: u16]
 /// [num_blocks: u32]
+/// [dict_size: u32]
+/// [dictionary: u8 × dict_size]
 /// [record_offsets: u32 × num_words]        — byte offset within decompressed block
 /// [block_index: (offset: u32, size: u32) × num_blocks]
 /// [compressed_block_data: ...]
@@ -282,9 +307,9 @@ fn block_compress_word_infos(
 
     let data_end = buf.len();
 
-    // Compress each block and compute intra-block record offsets
+    // First pass: collect raw blocks as samples and compute intra-block offsets
     let mut record_offsets = vec![0u32; num_words];
-    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
 
     for block_idx in 0..num_blocks {
         let start_word = block_idx * records_per_block;
@@ -303,7 +328,20 @@ fn block_compress_word_infos(
             record_offsets[i] = (orig_offsets[i] - block_data_start) as u32;
         }
 
-        let compressed = zstd::bulk::compress(block_data, 19)
+        samples.push(block_data.to_vec());
+    }
+
+    // Train dictionary from samples
+    let dict = zstd::dict::from_samples(&samples, 112 * 1024)
+        .expect("zstd dictionary training failed");
+    eprintln!("    Trained word_infos dictionary: {} bytes", dict.len());
+
+    // Compress each block with the dictionary
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
+        .expect("failed to create compressor with dictionary");
+    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    for sample in &samples {
+        let compressed = compressor.compress(sample)
             .expect("zstd compression failed");
         compressed_blocks.push(compressed);
     }
@@ -314,6 +352,10 @@ fn block_compress_word_infos(
     result.extend_from_slice(&(num_words as u32).to_le_bytes());
     result.extend_from_slice(&(records_per_block as u16).to_le_bytes());
     result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+    // Dictionary
+    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    result.extend_from_slice(&dict);
 
     // Record offsets (intra-block)
     for &off in &record_offsets {

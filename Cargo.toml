@@ -26,6 +26,6 @@ serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zdict_builder"] }
 
 
