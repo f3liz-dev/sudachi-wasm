@@ -93,16 +93,24 @@
     const dictCache = new Map();
     let loadedDictVariant = null;
 
-    /** Convert katakana string to hiragana (for furigana display). */
+    /** Convert katakana string to hiragana (for furigana display).
+     *  Note: Sudachi preserves particle kana as-is (ハ→は, ヘ→へ, ヲ→を),
+     *  so this simple offset correctly round-trips them. */
     function katakanaToHiragana(str) {
       return str.replace(/[\u30A1-\u30F6]/g, ch =>
         String.fromCharCode(ch.charCodeAt(0) - 0x60)
       );
     }
 
+    /** Return true if ch is a CJK kanji character. */
+    function isKanji(ch) {
+      const c = ch.codePointAt(0);
+      return (c >= 0x3400 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF);
+    }
+
     /** Return true if the string contains at least one kanji (CJK) character. */
     function containsKanji(str) {
-      return /[\u3400-\u9FFF\uF900-\uFAFF]/.test(str);
+      return [...str].some(isKanji);
     }
 
     /** Escape HTML special characters for safe insertion via innerHTML. */
@@ -111,6 +119,107 @@
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
+    }
+
+    /** Escape a string for use as a literal in a RegExp. */
+    function escapeRegex(str) {
+      return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    /**
+     * Split a surface form into alternating kanji / non-kanji segments.
+     * e.g. "又は" → [{type:"kanji",text:"又"}, {type:"kana",text:"は"}]
+     *      "食べ物" → [{kanji,"食"}, {kana,"べ"}, {kanji,"物"}]
+     */
+    function splitSurface(surface) {
+      const segs = [];
+      let cur = "";
+      let curType = null;
+      for (const ch of surface) {
+        const t = isKanji(ch) ? "kanji" : "kana";
+        if (t !== curType) {
+          if (cur) segs.push({ type: curType, text: cur });
+          cur = ch;
+          curType = t;
+        } else {
+          cur += ch;
+        }
+      }
+      if (cur) segs.push({ type: curType, text: cur });
+      return segs;
+    }
+
+    /**
+     * Align a hiragana reading to the kanji/kana segments of a surface form.
+     *
+     * Strategy:
+     *   - Kana segments act as anchors inside the reading string.
+     *   - We build a regex where each kanji run becomes a capture group (.+?)
+     *     and each kana run becomes a literal match.
+     *   - This handles cases like:
+     *       又は / または  →  又(また)は
+     *       食べ物 / たべもの →  食(た)べ物(もの)
+     *   - The last kanji group (if no kana follows it) is greedy (.+) so
+     *     it consumes the rest of the reading without over-splitting.
+     *
+     * Returns an array of segments with .reading filled in for kanji runs,
+     * or throws AlignmentError when no rule matches.
+     */
+    class AlignmentError extends Error {}
+
+    function alignFurigana(surface, reading) {
+      const segs = splitSurface(surface);
+
+      // No kanji at all — caller should skip furigana entirely
+      if (!segs.some(s => s.type === "kanji")) return null;
+
+      // No kana anchors — whole surface maps to whole reading
+      if (!segs.some(s => s.type === "kana")) {
+        return [{ type: "kanji", text: surface, reading }];
+      }
+
+      // Build a regex using kana runs as literals and kanji runs as captures.
+      // Greedy (.+) for the last kanji group when it has no trailing kana anchor,
+      // non-greedy (.+?) otherwise.
+      let pattern = "^";
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        if (seg.type === "kanji") {
+          const noKanaAfter = segs.slice(i + 1).every(s => s.type !== "kana");
+          pattern += noKanaAfter ? "(.+)" : "(.+?)";
+        } else {
+          pattern += escapeRegex(seg.text);
+        }
+      }
+      pattern += "$";
+
+      const match = reading.match(new RegExp(pattern));
+      if (!match) {
+        throw new AlignmentError(
+          `Cannot align furigana: surface="${surface}", reading="${reading}"`
+        );
+      }
+
+      let cap = 1;
+      return segs.map(seg =>
+        seg.type === "kanji"
+          ? { type: "kanji", text: seg.text, reading: match[cap++] }
+          : { type: "kana",  text: seg.text }
+      );
+    }
+
+    /** Render pre-aligned segments into HTML or text furigana. */
+    function renderSegments(segs, style) {
+      return segs.map(seg => {
+        if (seg.type === "kanji") {
+          const s = escapeHtml(seg.text);
+          const r = escapeHtml(seg.reading);
+          return style === "ruby"
+            ? `<ruby>${s}<rt>${r}</rt></ruby>`
+            : `${s}(${r})`;
+        }
+        return escapeHtml(seg.text);
+      }).join("");
     }
 
     function setStatus(msg) {
@@ -211,20 +320,43 @@
     function renderFurigana(morphemes) {
       lastMorphemes = morphemes;
       const style = document.getElementById("furigana-style").value;
+      const alignErrors = [];
+
       const html = morphemes.map(m => {
         const reading = katakanaToHiragana(m.readingForm);
-        const surface = escapeHtml(m.surface);
-        if (containsKanji(m.surface) && reading !== m.surface) {
-          if (style === "ruby") {
-            return `<ruby>${surface}<rt>${escapeHtml(reading)}</rt></ruby>`;
-          } else {
-            return `${surface}(${escapeHtml(reading)})`;
-          }
+        const surface = m.surface;
+
+        // No kanji or reading identical to surface — plain text
+        if (!containsKanji(surface) || reading === surface) {
+          return escapeHtml(surface);
         }
-        return surface;
+
+        try {
+          const segs = alignFurigana(surface, reading);
+          // alignFurigana returns null when surface has no kanji (already guarded above)
+          return renderSegments(segs, style);
+        } catch (e) {
+          // Alignment failed — record for error report and fall back to whole-word furigana
+          alignErrors.push({ surface, reading });
+          const s = escapeHtml(surface);
+          const r = escapeHtml(reading);
+          return style === "ruby"
+            ? `<ruby>${s}<rt>${r}</rt></ruby>`
+            : `${s}(${r})`;
+        }
       }).join("");
+
       document.getElementById("furigana-box").innerHTML = html;
       document.getElementById("furigana-box").hidden = (currentView !== "furigana");
+
+      if (alignErrors.length > 0) {
+        const detail = alignErrors.map(e => `「${e.surface}」(${e.reading})`).join("、");
+        setStatus(
+          `⚠️ Furigana alignment failed for: ${detail} — ` +
+          `whole-word furigana used as fallback. Please report this to the developer.`
+        );
+        console.warn("[sudachi-wasm] furigana alignment errors:", alignErrors);
+      }
     }
 
     function renderTable(morphemes) {
