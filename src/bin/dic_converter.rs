@@ -2,13 +2,12 @@
 //!
 //! Reads a standard Sudachi `.dic` file and writes a new `.dic` file with:
 //! 1. MARISA trie index (replacing YADA double-array trie)
-//! 2. Block-compressed connection matrix (deflate, 64×64 blocks)
-//! 3. Block-compressed word_infos (deflate, 64-record blocks)
+//! 2. Block-compressed connection matrix (zstd, 64×64 blocks)
+//! 3. Block-compressed word_infos (zstd, 64-record blocks)
 //!
 //! Usage:
 //!   dic_converter <input.dic> <output.dic>
 
-use miniz_oxide::deflate::compress_to_vec;
 use rsmarisa::grimoire::io::Writer;
 use rsmarisa::{Agent, Keyset};
 use std::env;
@@ -84,7 +83,7 @@ fn parse_grammar(
     (pos_list_bytes, left_id, right_id, matrix_start, matrix_end)
 }
 
-/// Compress the connection matrix into 64×64 deflate blocks.
+/// Compress the connection matrix into 64×64 zstd blocks.
 ///
 /// Output format:
 /// ```text
@@ -116,7 +115,8 @@ fn compress_connection_matrix(
                     block_data.extend_from_slice(&buf[pos..pos + 2]);
                 }
             }
-            let compressed = compress_to_vec(&block_data, 9);
+            let compressed = zstd::bulk::compress(&block_data, 19)
+                .expect("zstd compression failed");
             compressed_blocks.push(compressed);
         }
     }
@@ -255,7 +255,7 @@ const WI_BLOCK_SIZE: usize = 64;
 
 /// Block-compress word_info records.
 ///
-/// Groups N consecutive records into deflate-compressed blocks.
+/// Groups N consecutive records into zstd-compressed blocks.
 /// Output format:
 /// ```text
 /// [MAGIC: u32]
@@ -303,7 +303,8 @@ fn block_compress_word_infos(
             record_offsets[i] = (orig_offsets[i] - block_data_start) as u32;
         }
 
-        let compressed = compress_to_vec(block_data, 9);
+        let compressed = zstd::bulk::compress(block_data, 19)
+            .expect("zstd compression failed");
         compressed_blocks.push(compressed);
     }
 
