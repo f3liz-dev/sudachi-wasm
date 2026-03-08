@@ -15,7 +15,7 @@ use std::fs;
 use std::process;
 
 const HEADER_SIZE: usize = 272;
-const BLOCK_SIZE: usize = 64;
+const BLOCK_SIZE: usize = 256;
 const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
 
 const SYSTEM_DICT_V1: u64 = 0x7366d3f18bd111e7;
@@ -124,12 +124,14 @@ fn compress_connection_matrix(
         }
     }
 
-    // Train dictionary from samples
-    let dict = zstd::dict::from_samples(&samples, 112 * 1024)
+    // Train dictionary from continuous buffer (more efficient than from_samples)
+    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
+    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
+    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
         .expect("zstd dictionary training failed");
     eprintln!("    Trained connection matrix dictionary: {} bytes", dict.len());
 
-    // Compress each block with the dictionary
+    // Compress each block with the dictionary at level 19
     let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
         .expect("failed to create compressor with dictionary");
     let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
@@ -273,7 +275,7 @@ fn build_marisa_section(entries: &[(Vec<u8>, u32)]) -> Vec<u8> {
 // ── Word infos block compression ────────────────────────────────────────
 
 const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
-const WI_BLOCK_SIZE: usize = 64;
+const WI_BLOCK_SIZE: usize = 128;
 
 /// Block-compress word_info records.
 ///
@@ -331,12 +333,14 @@ fn block_compress_word_infos(
         samples.push(block_data.to_vec());
     }
 
-    // Train dictionary from samples
-    let dict = zstd::dict::from_samples(&samples, 112 * 1024)
+    // Train dictionary from continuous buffer (more efficient than from_samples)
+    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
+    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
+    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
         .expect("zstd dictionary training failed");
     eprintln!("    Trained word_infos dictionary: {} bytes", dict.len());
 
-    // Compress each block with the dictionary
+    // Compress each block with the dictionary at level 19
     let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
         .expect("failed to create compressor with dictionary");
     let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
