@@ -9,7 +9,9 @@
     .controls { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
     input[type=text] { flex: 1; font-size: 1rem; padding: .3rem .5rem; }
     select, button   { font-size: 1rem; padding: .3rem .6rem; }
-    #status { color: #666; font-style: italic; margin-bottom: 1rem; }
+    #status { color: #666; font-style: italic; margin-bottom: .4rem; }
+    #progress-wrap { margin-bottom: 1rem; height: 6px; background: #e0e0e0; border-radius: 3px; display: none; }
+    #progress-bar  { height: 100%; width: 0%; background: #4a90d9; border-radius: 3px; transition: width .1s linear; }
     table   { width: 100%; border-collapse: collapse; }
     th, td  { border: 1px solid #ccc; padding: .35rem .6rem; text-align: left; }
     th      { background: #f0f0f0; }
@@ -42,6 +44,7 @@
   <h1>Sudachi Japanese Morphological Analyzer (WASM)</h1>
 
   <p id="status">⏳ Loading dictionary…</p>
+  <div id="progress-wrap"><div id="progress-bar"></div></div>
 
   <div class="controls">
     <input id="text" type="text" value="今日はいい天気ですね。" />
@@ -114,12 +117,45 @@
       document.getElementById("status").textContent = msg;
     }
 
+    function setProgress(fraction) {
+      const wrap = document.getElementById("progress-wrap");
+      const bar  = document.getElementById("progress-bar");
+      if (fraction == null) {
+        wrap.style.display = "none";
+        bar.style.width = "0%";
+      } else {
+        wrap.style.display = "block";
+        bar.style.width = `${Math.round(fraction * 100)}%`;
+      }
+    }
+
     /** Fetch a dictionary variant (cached). Returns Uint8Array. */
     async function fetchDict(variant) {
       if (dictCache.has(variant)) return dictCache.get(variant);
       const resp = await fetch(`system_${variant}.dic`);
       if (!resp.ok) throw new Error(`Failed to fetch system_${variant}.dic: ${resp.status}`);
-      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const total = parseInt(resp.headers.get("content-length") || "0", 10);
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        const label = { small: "Small", core: "Core", full: "Full" }[variant];
+        if (total > 0) {
+          const pct = Math.round((received / total) * 100);
+          setStatus(`⏳ Downloading ${label} dictionary… ${pct}%`);
+          setProgress(received / total);
+        } else {
+          setStatus(`⏳ Downloading ${label} dictionary… ${(received / 1048576).toFixed(1)} MB`);
+        }
+      }
+      // Merge chunks into a single Uint8Array
+      const bytes = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
       dictCache.set(variant, bytes);
       return bytes;
     }
@@ -131,6 +167,8 @@
       const label = { small: "Small", core: "Core", full: "Full" }[variant];
       setStatus(`⏳ Loading ${label} dictionary…`);
       const bytes = await fetchDict(variant);
+      setStatus(`⏳ Building tokenizer…`);
+      setProgress(null);
       tokenizer = new Tokenizer(bytes);
       loadedDictVariant = variant;
       setStatus(`✅ Ready (${label} dictionary)`);
