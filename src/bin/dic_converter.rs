@@ -1,0 +1,455 @@
+//! Dictionary converter: YADA → MARISA with compression.
+//!
+//! Reads a standard Sudachi `.dic` file and writes a new `.dic` file with:
+//! 1. MARISA trie index (replacing YADA double-array trie)
+//! 2. Block-compressed connection matrix (deflate, 64×64 blocks)
+//! 3. Block-compressed word_infos (deflate, 64-record blocks)
+//!
+//! Usage:
+//!   dic_converter <input.dic> <output.dic>
+
+use miniz_oxide::deflate::compress_to_vec;
+use rsmarisa::grimoire::io::Writer;
+use rsmarisa::{Agent, Keyset};
+use std::env;
+use std::fs;
+use std::process;
+
+const HEADER_SIZE: usize = 272;
+const BLOCK_SIZE: usize = 64;
+const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
+
+const SYSTEM_DICT_V1: u64 = 0x7366d3f18bd111e7;
+const SYSTEM_DICT_V2: u64 = 0xce9f011a92394434;
+const USER_DICT_V2: u64 = 0x9fdeb5a90168d868;
+const USER_DICT_V3: u64 = 0xca9811756ff64fb0;
+
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+}
+
+fn read_i16_le(buf: &[u8], off: usize) -> i16 {
+    i16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn has_grammar(version: u64) -> bool {
+    matches!(
+        version,
+        SYSTEM_DICT_V1 | SYSTEM_DICT_V2 | USER_DICT_V2 | USER_DICT_V3
+    )
+}
+
+// ── Grammar section parsing ─────────────────────────────────────────────
+
+/// Parse grammar section, returning (pos_list_bytes, left_id, right_id, matrix_start, matrix_end).
+fn parse_grammar(
+    buf: &[u8],
+    grammar_offset: usize,
+) -> (Vec<u8>, usize, usize, usize, usize) {
+    let mut off = grammar_offset;
+    let pos_count = read_u16_le(buf, off) as usize;
+    off += 2;
+
+    for _ in 0..pos_count {
+        for _ in 0..6 {
+            let str_len = buf[off] as usize;
+            if str_len >= 128 {
+                let actual = ((str_len & 0x7f) << 8) | buf[off + 1] as usize;
+                off += 2 + actual * 2;
+            } else {
+                off += 1 + str_len * 2;
+            }
+        }
+    }
+
+    let left_id = read_i16_le(buf, off) as usize;
+    off += 2;
+    let right_id = read_i16_le(buf, off) as usize;
+    off += 2;
+
+    let matrix_start = off;
+    let matrix_end = off + left_id * right_id * 2;
+
+    // pos_list_bytes includes the pos_count, POS entries, left_id, right_id
+    let pos_list_bytes = buf[grammar_offset..matrix_start].to_vec();
+
+    (pos_list_bytes, left_id, right_id, matrix_start, matrix_end)
+}
+
+/// Compress the connection matrix into 64×64 deflate blocks.
+///
+/// Output format:
+/// ```text
+/// [COMPRESSED_MAGIC: u32]
+/// [num_left: u16][num_right: u16]
+/// [num_blocks: u32]
+/// [block_index: (offset: u32, compressed_size: u32) × num_blocks]
+/// [compressed_block_data: ...]
+/// ```
+fn compress_connection_matrix(
+    buf: &[u8],
+    matrix_start: usize,
+    num_left: usize,
+    num_right: usize,
+) -> Vec<u8> {
+    let num_row_blocks = (num_right + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_col_blocks = (num_left + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_blocks = num_row_blocks * num_col_blocks;
+
+    // Compress each block
+    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    for rb in 0..num_row_blocks {
+        for cb in 0..num_col_blocks {
+            let mut block_data = Vec::new();
+            for r in (rb * BLOCK_SIZE)..std::cmp::min((rb + 1) * BLOCK_SIZE, num_right) {
+                for c in (cb * BLOCK_SIZE)..std::cmp::min((cb + 1) * BLOCK_SIZE, num_left) {
+                    let idx = r * num_left + c;
+                    let pos = matrix_start + idx * 2;
+                    block_data.extend_from_slice(&buf[pos..pos + 2]);
+                }
+            }
+            let compressed = compress_to_vec(&block_data, 9);
+            compressed_blocks.push(compressed);
+        }
+    }
+
+    // Build output
+    let mut result = Vec::new();
+    result.extend_from_slice(&COMPRESSED_MAGIC.to_le_bytes());
+    result.extend_from_slice(&(num_left as u16).to_le_bytes());
+    result.extend_from_slice(&(num_right as u16).to_le_bytes());
+    result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+    // Build block index
+    let mut data_offset: u32 = 0;
+    for block in &compressed_blocks {
+        result.extend_from_slice(&data_offset.to_le_bytes());
+        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        data_offset += block.len() as u32;
+    }
+
+    // Write compressed data
+    for block in &compressed_blocks {
+        result.extend_from_slice(block);
+    }
+
+    result
+}
+
+// ── YADA trie helpers ───────────────────────────────────────────────────
+
+#[inline]
+fn yada_label(unit: u32) -> u32 {
+    unit & ((1 << 31) | 0xFF)
+}
+
+#[inline]
+fn yada_has_leaf(unit: u32) -> bool {
+    ((unit >> 8) & 1) == 1
+}
+
+#[inline]
+fn yada_offset(unit: u32) -> u32 {
+    (unit >> 10) << ((unit & (1 << 9)) >> 6)
+}
+
+#[inline]
+fn yada_value(unit: u32) -> u32 {
+    unit & ((1 << 31) - 1)
+}
+
+fn parse_yada_array(buf: &[u8], offset: usize) -> (Vec<u32>, usize) {
+    let trie_size = read_u32_le(buf, offset) as usize;
+    let data_start = offset + 4;
+    let data_end = data_start + trie_size * 4;
+    let mut array = Vec::with_capacity(trie_size);
+    for i in 0..trie_size {
+        array.push(read_u32_le(buf, data_start + i * 4));
+    }
+    (array, data_end)
+}
+
+fn extract_yada_entries(array: &[u32]) -> Vec<(Vec<u8>, u32)> {
+    let mut results = Vec::new();
+    if array.is_empty() {
+        return results;
+    }
+    let root_unit = array[0];
+    let root_offset = yada_offset(root_unit) as usize;
+    let mut path = Vec::new();
+    yada_dfs(array, root_offset, &mut path, &mut results);
+    results
+}
+
+fn yada_dfs(
+    array: &[u32],
+    node_pos: usize,
+    path: &mut Vec<u8>,
+    results: &mut Vec<(Vec<u8>, u32)>,
+) {
+    for k in 0u16..=255 {
+        let child_pos = node_pos ^ (k as usize);
+        if child_pos >= array.len() {
+            continue;
+        }
+        let unit = array[child_pos];
+        if yada_label(unit) != k as u32 {
+            continue;
+        }
+        path.push(k as u8);
+        let new_node_pos = child_pos ^ yada_offset(unit) as usize;
+        if yada_has_leaf(unit) && new_node_pos < array.len() {
+            let val = yada_value(array[new_node_pos]);
+            results.push((path.clone(), val));
+        }
+        yada_dfs(array, new_node_pos, path, results);
+        path.pop();
+    }
+}
+
+fn build_marisa_section(entries: &[(Vec<u8>, u32)]) -> Vec<u8> {
+    let mut keyset = Keyset::new();
+    for (key, _) in entries {
+        keyset
+            .push_back_bytes(key, 1.0)
+            .expect("failed to add key to keyset");
+    }
+    let mut trie = rsmarisa::Trie::new();
+    trie.build(&mut keyset, 0);
+
+    let num_keys = trie.num_keys();
+    let mut id_to_offset = vec![0u32; num_keys];
+    let mut agent = Agent::new();
+    for (key, offset_val) in entries {
+        agent.set_query_bytes(key);
+        assert!(trie.lookup(&mut agent), "key not found after build");
+        id_to_offset[agent.key().id()] = *offset_val;
+    }
+
+    let mut writer = Writer::from_vec(Vec::new());
+    trie.write(&mut writer).expect("failed to serialize trie");
+    let trie_bytes = writer.into_inner().expect("failed to get trie bytes");
+
+    let mut result = Vec::with_capacity(4 + trie_bytes.len() + 4 + id_to_offset.len() * 4);
+    result.extend_from_slice(&(trie_bytes.len() as u32).to_le_bytes());
+    result.extend_from_slice(&trie_bytes);
+    result.extend_from_slice(&(id_to_offset.len() as u32).to_le_bytes());
+    for &off in &id_to_offset {
+        result.extend_from_slice(&off.to_le_bytes());
+    }
+    result
+}
+
+// ── Word infos block compression ────────────────────────────────────────
+
+const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
+const WI_BLOCK_SIZE: usize = 64;
+
+/// Block-compress word_info records.
+///
+/// Groups N consecutive records into deflate-compressed blocks.
+/// Output format:
+/// ```text
+/// [MAGIC: u32]
+/// [num_words: u32]
+/// [records_per_block: u16]
+/// [num_blocks: u32]
+/// [record_offsets: u32 × num_words]        — byte offset within decompressed block
+/// [block_index: (offset: u32, size: u32) × num_blocks]
+/// [compressed_block_data: ...]
+/// ```
+fn block_compress_word_infos(
+    buf: &[u8],
+    word_infos_start: usize,
+    num_words: usize,
+) -> Vec<u8> {
+    let records_per_block = WI_BLOCK_SIZE;
+    let num_blocks = (num_words + records_per_block - 1) / records_per_block;
+
+    // Read original absolute offsets
+    let mut orig_offsets = Vec::with_capacity(num_words);
+    for i in 0..num_words {
+        orig_offsets.push(read_u32_le(buf, word_infos_start + i * 4) as usize);
+    }
+
+    let data_end = buf.len();
+
+    // Compress each block and compute intra-block record offsets
+    let mut record_offsets = vec![0u32; num_words];
+    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+
+    for block_idx in 0..num_blocks {
+        let start_word = block_idx * records_per_block;
+        let end_word = std::cmp::min(start_word + records_per_block, num_words);
+
+        let block_data_start = orig_offsets[start_word];
+        let block_data_end = if end_word < num_words {
+            orig_offsets[end_word]
+        } else {
+            data_end
+        };
+
+        let block_data = &buf[block_data_start..block_data_end];
+
+        for i in start_word..end_word {
+            record_offsets[i] = (orig_offsets[i] - block_data_start) as u32;
+        }
+
+        let compressed = compress_to_vec(block_data, 9);
+        compressed_blocks.push(compressed);
+    }
+
+    // Build output
+    let mut result = Vec::new();
+    result.extend_from_slice(&BLOCK_WI_MAGIC.to_le_bytes());
+    result.extend_from_slice(&(num_words as u32).to_le_bytes());
+    result.extend_from_slice(&(records_per_block as u16).to_le_bytes());
+    result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+    // Record offsets (intra-block)
+    for &off in &record_offsets {
+        result.extend_from_slice(&off.to_le_bytes());
+    }
+
+    // Block index
+    let mut data_offset: u32 = 0;
+    for block in &compressed_blocks {
+        result.extend_from_slice(&data_offset.to_le_bytes());
+        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        data_offset += block.len() as u32;
+    }
+
+    // Compressed data
+    for block in &compressed_blocks {
+        result.extend_from_slice(block);
+    }
+
+    result
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <input.dic> <output.dic>", args[0]);
+        eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
+        eprintln!("with connection matrix and word_infos block compression.");
+        process::exit(1);
+    }
+
+    let input_path = &args[1];
+    let output_path = &args[2];
+
+    eprintln!("Reading {}...", input_path);
+    let buf = fs::read(input_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", input_path, e);
+        process::exit(1);
+    });
+
+    if buf.len() < HEADER_SIZE {
+        eprintln!("File too small to be a Sudachi dictionary");
+        process::exit(1);
+    }
+
+    let version = read_u64_le(&buf, 0);
+    let has_gram = has_grammar(version);
+    eprintln!(
+        "  Header version: 0x{:016x}, has_grammar: {}",
+        version, has_gram
+    );
+
+    // ── 1. Header ──────────────────────────────────────────────────────
+    let mut output = Vec::with_capacity(buf.len());
+    output.extend_from_slice(&buf[..HEADER_SIZE]);
+
+    // ── 2. Grammar (POS list + compressed connection matrix) ────────
+    let lexicon_offset;
+    if has_gram {
+        let (pos_list_bytes, left_id, right_id, matrix_start, matrix_end) =
+            parse_grammar(&buf, HEADER_SIZE);
+
+        // Write POS list + left_id + right_id
+        output.extend_from_slice(&pos_list_bytes);
+
+        // Compress and write connection matrix
+        let original_matrix_size = (matrix_end - matrix_start) as f64;
+        let compressed = compress_connection_matrix(&buf, matrix_start, left_id, right_id);
+        eprintln!(
+            "  Connection matrix: {:.1} MB → {:.1} MB ({:.1}x compression)",
+            original_matrix_size / 1024.0 / 1024.0,
+            compressed.len() as f64 / 1024.0 / 1024.0,
+            original_matrix_size / compressed.len() as f64
+        );
+        output.extend_from_slice(&compressed);
+
+        lexicon_offset = matrix_end;
+    } else {
+        lexicon_offset = HEADER_SIZE;
+    }
+
+    // ── 3. MARISA trie ──────────────────────────────────────────────
+    let (yada_array, after_trie_offset) = parse_yada_array(&buf, lexicon_offset);
+    eprintln!(
+        "  YADA trie: {} units ({} bytes)",
+        yada_array.len(),
+        yada_array.len() * 4
+    );
+
+    let entries = extract_yada_entries(&yada_array);
+    eprintln!("  Extracted {} trie entries", entries.len());
+
+    let marisa_section = build_marisa_section(&entries);
+    eprintln!(
+        "  MARISA trie: {} bytes ({:.1}x compression)",
+        marisa_section.len(),
+        (yada_array.len() * 4 + 4) as f64 / marisa_section.len() as f64
+    );
+    output.extend_from_slice(&marisa_section);
+
+    // ── 4. Word ID table + Word params (copy as-is) ─────────────────
+    let mut post_offset = after_trie_offset;
+    let word_id_table_size = read_u32_le(&buf, post_offset) as usize;
+    let wit_end = post_offset + 4 + word_id_table_size;
+    output.extend_from_slice(&buf[post_offset..wit_end]);
+    post_offset = wit_end;
+
+    let word_params_size = read_u32_le(&buf, post_offset) as usize;
+    let wp_end = post_offset + 4 + word_params_size * 6;
+    output.extend_from_slice(&buf[post_offset..wp_end]);
+    post_offset = wp_end;
+
+    // ── 5. Block-compressed word infos ─────────────────────────────
+    let word_infos_start = post_offset;
+    let original_wi_size = buf.len() - word_infos_start;
+
+    let compressed_wi = block_compress_word_infos(&buf, word_infos_start, word_params_size);
+    eprintln!(
+        "  Word infos: {:.1} MB → {:.1} MB ({:.1}x compression, {}-record blocks)",
+        original_wi_size as f64 / 1024.0 / 1024.0,
+        compressed_wi.len() as f64 / 1024.0 / 1024.0,
+        original_wi_size as f64 / compressed_wi.len() as f64,
+        WI_BLOCK_SIZE,
+    );
+    output.extend_from_slice(&compressed_wi);
+
+    // ── Write output ────────────────────────────────────────────────
+    fs::write(output_path, &output).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {}", output_path, e);
+        process::exit(1);
+    });
+
+    eprintln!(
+        "\n  Total: {:.1} MB → {:.1} MB ({:.1}% of original)",
+        buf.len() as f64 / 1024.0 / 1024.0,
+        output.len() as f64 / 1024.0 / 1024.0,
+        output.len() as f64 / buf.len() as f64 * 100.0
+    );
+    eprintln!("Done: {}", output_path);
+}
