@@ -102,10 +102,11 @@
       );
     }
 
-    /** Return true if ch is a CJK kanji character. */
+    /** Return true if ch is a CJK kanji character (including iteration marks 々〻). */
     function isKanji(ch) {
       const c = ch.codePointAt(0);
-      return (c >= 0x3400 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF);
+      return (c >= 0x3400 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF)
+          || c === 0x3005 /* 々 */ || c === 0x303B /* 〻 */;
     }
 
     /** Return true if the string contains at least one kanji (CJK) character. */
