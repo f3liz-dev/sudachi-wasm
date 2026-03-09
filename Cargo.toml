@@ -14,6 +14,10 @@ crate-type = ["cdylib"]
 name = "dic_converter"
 path = "src/bin/dic_converter.rs"
 
+[[bin]]
+name = "kkc_builder"
+path = "src/bin/kkc_builder.rs"
+
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
 

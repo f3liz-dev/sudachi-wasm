@@ -40,19 +40,57 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Install Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+
+      - name: Cache Julia
+        uses: actions/cache@v4
+        with:
+          path: ~/.julia
+          key: ${{ runner.os }}-julia-${{ hashFiles('jlmarisa/Project.toml') }}
+          restore-keys: ${{ runner.os }}-julia-
+
+      - name: Install Julia dependencies
+        run: julia --project=../jlmarisa -e 'using Pkg; Pkg.instantiate()'
+
       - name: Build WASM
         run: wasm-pack build --target web --release
 
-      - name: Build dictionary converter
-        run: cargo build --bin dic_converter --release
+      - name: Build tools
+        run: cargo build --bin dic_converter --bin kkc_builder --release
 
       - name: Download and convert dictionaries
         run: |
           for variant in small core full; do
+            echo "════════════════════════════════════════════════════════"
+            echo "  Processing dictionary: ${variant}"
+            echo "════════════════════════════════════════════════════════"
+
+            # Download source dictionary (YADA format)
             curl -L "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/sudachi-dictionary-latest-${variant}.zip" \
               -o dict.zip
             unzip -j dict.zip "*/system_${variant}.dic" -d .
-            ./target/release/dic_converter "system_${variant}.dic" "system_${variant}_marisa.dic"
+
+            # ── Normal MARISA dictionary (no cost adjustments) ──
+            ./target/release/dic_converter \
+              "system_${variant}.dic" \
+              "system_${variant}_marisa.dic"
+
+            # ── KKC-optimized dictionary (Julia-adjusted costs) ──
+            ./target/release/kkc_builder --export "system_${variant}.dic" "words_${variant}.csv"
+            julia --project=../jlmarisa julia/kkc_costs.jl "words_${variant}.csv" "workdir_${variant}"
+            ./target/release/dic_converter \
+              "system_${variant}.dic" \
+              "system_${variant}_kkc.dic" \
+              --cost-csv "workdir_${variant}/adjusted.csv"
+
+            # Cleanup intermediates
+            rm -f dict.zip "system_${variant}.dic" "words_${variant}.csv"
+            rm -rf "workdir_${variant}"
+
+            # Final names
             mv "system_${variant}_marisa.dic" "system_${variant}.dic"
           done
 
@@ -62,6 +100,7 @@ jobs:
           cp examples/browser/index.html _site/
           cp -r pkg _site/pkg
           cp system_small.dic system_core.dic system_full.dic _site/
+          cp system_small_kkc.dic system_core_kkc.dic system_full_kkc.dic _site/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -53,6 +53,9 @@
       <option value="core" selected>Core dict</option>
       <option value="full">Full dict</option>
     </select>
+    <label title="Use KKC-optimized dictionary (Julia-adjusted costs for IME use)">
+      <input id="kkc" type="checkbox" /> KKC
+    </label>
     <select id="mode" title="Split mode">
       <option value="C" selected>C – named entity (longest)</option>
       <option value="B">B – word level</option>
@@ -240,10 +243,12 @@
     }
 
     /** Fetch a dictionary variant (cached). Returns Uint8Array. */
-    async function fetchDict(variant) {
-      if (dictCache.has(variant)) return dictCache.get(variant);
-      const resp = await fetch(`system_${variant}.dic`);
-      if (!resp.ok) throw new Error(`Failed to fetch system_${variant}.dic: ${resp.status}`);
+    async function fetchDict(variant, kkc) {
+      const key = kkc ? `${variant}_kkc` : variant;
+      if (dictCache.has(key)) return dictCache.get(key);
+      const filename = kkc ? `system_${variant}_kkc.dic` : `system_${variant}.dic`;
+      const resp = await fetch(filename);
+      if (!resp.ok) throw new Error(`Failed to fetch ${filename}: ${resp.status}`);
       const total = parseInt(resp.headers.get("content-length") || "0", 10);
       const reader = resp.body.getReader();
       const chunks = [];
@@ -254,47 +259,55 @@
         chunks.push(value);
         received += value.length;
         const label = { small: "Small", core: "Core", full: "Full" }[variant];
+        const suffix = kkc ? " KKC" : "";
         if (total > 0) {
           const pct = Math.round((received / total) * 100);
-          setStatus(`⏳ Downloading ${label} dictionary… ${pct}%`);
+          setStatus(`⏳ Downloading ${label}${suffix} dictionary… ${pct}%`);
           setProgress(received / total);
         } else {
-          setStatus(`⏳ Downloading ${label} dictionary… ${(received / 1048576).toFixed(1)} MB`);
+          setStatus(`⏳ Downloading ${label}${suffix} dictionary… ${(received / 1048576).toFixed(1)} MB`);
         }
       }
       // Merge chunks into a single Uint8Array
       const bytes = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-      dictCache.set(variant, bytes);
+      dictCache.set(key, bytes);
       return bytes;
     }
 
     /** Load (or switch to) a dictionary variant, rebuilding the tokenizer. */
-    async function loadDict(variant) {
-      if (loadedDictVariant === variant) return;
+    async function loadDict(variant, kkc) {
+      const key = kkc ? `${variant}_kkc` : variant;
+      if (loadedDictVariant === key) return;
       document.getElementById("btn").disabled = true;
       const label = { small: "Small", core: "Core", full: "Full" }[variant];
-      setStatus(`⏳ Loading ${label} dictionary…`);
-      const bytes = await fetchDict(variant);
+      const suffix = kkc ? " KKC" : "";
+      setStatus(`⏳ Loading ${label}${suffix} dictionary…`);
+      const bytes = await fetchDict(variant, kkc);
       setStatus(`⏳ Building tokenizer…`);
       setProgress(null);
       tokenizer = new Tokenizer(bytes);
-      loadedDictVariant = variant;
-      setStatus(`✅ Ready (${label} dictionary)`);
+      loadedDictVariant = key;
+      setStatus(`✅ Ready (${label}${suffix} dictionary)`);
       document.getElementById("btn").disabled = false;
     }
 
     async function setup() {
       await init();
       const initialVariant = document.getElementById("dict").value;
-      await loadDict(initialVariant);
+      const kkc = document.getElementById("kkc").checked;
+      await loadDict(initialVariant, kkc);
     }
 
-    // Reload tokenizer when dictionary selector changes
-    document.getElementById("dict").addEventListener("change", e => {
-      loadDict(e.target.value).catch(err => setStatus(`❌ ${err.message}`));
-    });
+    // Reload tokenizer when dictionary selector or KKC toggle changes
+    function reloadDict() {
+      const variant = document.getElementById("dict").value;
+      const kkc = document.getElementById("kkc").checked;
+      loadDict(variant, kkc).catch(err => setStatus(`❌ ${err.message}`));
+    }
+    document.getElementById("dict").addEventListener("change", reloadDict);
+    document.getElementById("kkc").addEventListener("change", reloadDict);
 
     // View tab switching
     let currentView = "furigana";

@@ -10,8 +10,10 @@
 
 use rsmarisa::grimoire::io::Writer;
 use rsmarisa::{Agent, Keyset};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::process;
 
 const HEADER_SIZE: usize = 272;
@@ -382,17 +384,169 @@ fn block_compress_word_infos(
     result
 }
 
+/// Build a reading-keyed MARISA trie from the output dictionary.
+///
+/// Parses the lexicon section of the output dictionary to iterate all words,
+/// collects reading → word_ids mapping, then builds a reading trie section
+/// with RTRI magic.
+fn build_reading_trie_section(
+    dict_bytes: &[u8],
+    lexicon_offset: usize,
+    has_synonym_group_ids: bool,
+) -> Vec<u8> {
+    use sudachi::dic::lexicon::Lexicon;
+    use sudachi::kana::hiragana_to_katakana;
+    use std::collections::BTreeMap;
+
+    const READING_TRIE_MAGIC: u32 = 0x5254_5249; // "RTRI"
+
+    // Parse lexicon directly from the MARISA-format output
+    let lexicon = Lexicon::parse(dict_bytes, lexicon_offset, has_synonym_group_ids)
+        .expect("Failed to parse lexicon for reading trie building");
+
+    // Collect reading → [raw_word_ids]
+    let mut reading_to_ids: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for (word_id, result) in lexicon.iter_reading_words() {
+        if let Ok(info) = result {
+            let reading = hiragana_to_katakana(info.reading_form());
+            if !reading.is_empty() {
+                reading_to_ids
+                    .entry(reading)
+                    .or_default()
+                    .push(word_id.word());
+            }
+        }
+    }
+
+    eprintln!("  Reading trie: {} unique readings", reading_to_ids.len());
+
+    // Build the word_id table: for each reading, store [count: u8][ids: u32 × count]
+    let mut word_id_table = Vec::new();
+    let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
+
+    for (reading, ids) in &reading_to_ids {
+        let offset = word_id_table.len() as u32;
+        let count = ids.len().min(255) as u8;
+        word_id_table.push(count);
+        for &wid in ids.iter().take(255) {
+            word_id_table.extend_from_slice(&wid.to_le_bytes());
+        }
+        entries.push((reading.as_bytes().to_vec(), offset));
+    }
+
+    // Build the MARISA trie from reading strings
+    let mut keyset = Keyset::new();
+    for (key, _) in &entries {
+        keyset
+            .push_back_bytes(key, 1.0)
+            .expect("failed to add reading to keyset");
+    }
+    let mut trie = rsmarisa::Trie::new();
+    trie.build(&mut keyset, 0);
+
+    let num_keys = trie.num_keys();
+    let mut id_to_offset = vec![0u32; num_keys];
+    let mut agent = Agent::new();
+    for (key, offset_val) in &entries {
+        agent.set_query_bytes(key);
+        assert!(trie.lookup(&mut agent), "reading key not found after build");
+        id_to_offset[agent.key().id()] = *offset_val;
+    }
+
+    let mut writer = Writer::from_vec(Vec::new());
+    trie.write(&mut writer).expect("failed to serialize reading trie");
+    let trie_bytes = writer.into_inner().expect("failed to get reading trie bytes");
+
+    // Assemble RTRI section
+    let mut result = Vec::new();
+    // Magic
+    result.extend_from_slice(&READING_TRIE_MAGIC.to_le_bytes());
+    // Trie data
+    result.extend_from_slice(&(trie_bytes.len() as u32).to_le_bytes());
+    result.extend_from_slice(&trie_bytes);
+    // ID-to-offset map
+    result.extend_from_slice(&(id_to_offset.len() as u32).to_le_bytes());
+    for &off in &id_to_offset {
+        result.extend_from_slice(&off.to_le_bytes());
+    }
+    // Word ID table
+    result.extend_from_slice(&(word_id_table.len() as u32).to_le_bytes());
+    result.extend_from_slice(&word_id_table);
+
+    eprintln!(
+        "  Reading trie section: {} bytes ({} keys)",
+        result.len(),
+        num_keys
+    );
+    result
+}
+
+// ── Cost CSV loading ────────────────────────────────────────────────────
+
+/// Load adjusted costs from a Julia-processed CSV.
+///
+/// Returns a map from word_id → adjusted cost (i16).
+/// CSV format: word_id,reading_hiragana,reading_katakana,surface,cost,...
+fn load_cost_csv(path: &str) -> HashMap<u32, i16> {
+    let file = fs::File::open(path).unwrap_or_else(|e| {
+        eprintln!("Failed to open cost CSV {}: {}", path, e);
+        process::exit(1);
+    });
+    let reader = BufReader::new(file);
+    let mut costs = HashMap::new();
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.unwrap();
+        if line_num == 0 {
+            continue; // skip header
+        }
+        // Parse: word_id,reading_h,reading_k,surface,cost,...
+        // word_id is field 0, cost is field 4
+        let fields: Vec<&str> = line.splitn(6, ',').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        if let (Ok(word_id), Ok(cost)) = (fields[0].parse::<u32>(), fields[4].parse::<i16>()) {
+            costs.insert(word_id, cost);
+        }
+    }
+
+    eprintln!("  Loaded {} cost adjustments from {}", costs.len(), path);
+    costs
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <input.dic> <output.dic>", args[0]);
+
+    // Parse arguments: <input.dic> <output.dic> [--cost-csv <adjusted.csv>]
+    if args.len() < 3 {
+        eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>]", args[0]);
         eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
         eprintln!("with connection matrix and word_infos block compression.");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --cost-csv <path>  Apply Julia-optimized costs from CSV");
         process::exit(1);
     }
 
     let input_path = &args[1];
     let output_path = &args[2];
+
+    // Parse optional --cost-csv flag
+    let cost_adjustments: Option<HashMap<u32, i16>> = {
+        let mut csv_path = None;
+        let mut i = 3;
+        while i < args.len() {
+            if args[i] == "--cost-csv" && i + 1 < args.len() {
+                csv_path = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                eprintln!("Unknown argument: {}", args[i]);
+                process::exit(1);
+            }
+        }
+        csv_path.map(|p| load_cost_csv(&p))
+    };
 
     eprintln!("Reading {}...", input_path);
     let buf = fs::read(input_path).unwrap_or_else(|e| {
@@ -458,9 +612,10 @@ fn main() {
         marisa_section.len(),
         (yada_array.len() * 4 + 4) as f64 / marisa_section.len() as f64
     );
+    let output_lexicon_offset = output.len();
     output.extend_from_slice(&marisa_section);
 
-    // ── 4. Word ID table + Word params (copy as-is) ─────────────────
+    // ── 4. Word ID table + Word params ────────────────────────────────
     let mut post_offset = after_trie_offset;
     let word_id_table_size = read_u32_le(&buf, post_offset) as usize;
     let wit_end = post_offset + 4 + word_id_table_size;
@@ -468,8 +623,32 @@ fn main() {
     post_offset = wit_end;
 
     let word_params_size = read_u32_le(&buf, post_offset) as usize;
-    let wp_end = post_offset + 4 + word_params_size * 6;
-    output.extend_from_slice(&buf[post_offset..wp_end]);
+    let wp_data_start = post_offset + 4;
+    let wp_end = wp_data_start + word_params_size * 6;
+
+    if let Some(ref adjustments) = cost_adjustments {
+        // Write word_params with adjusted costs
+        output.extend_from_slice(&buf[post_offset..wp_data_start]); // size u32
+        let mut patched = 0u32;
+        for wid in 0..word_params_size {
+            let entry_off = wp_data_start + wid * 6;
+            let left_id = read_i16_le(&buf, entry_off);
+            let right_id = read_i16_le(&buf, entry_off + 2);
+            let cost = if let Some(&adj_cost) = adjustments.get(&(wid as u32)) {
+                patched += 1;
+                adj_cost
+            } else {
+                read_i16_le(&buf, entry_off + 4)
+            };
+            output.extend_from_slice(&left_id.to_le_bytes());
+            output.extend_from_slice(&right_id.to_le_bytes());
+            output.extend_from_slice(&cost.to_le_bytes());
+        }
+        eprintln!("  Word params: patched {}/{} costs from CSV", patched, word_params_size);
+    } else {
+        // Copy word_params as-is
+        output.extend_from_slice(&buf[post_offset..wp_end]);
+    }
     post_offset = wp_end;
 
     // ── 5. Block-compressed word infos ─────────────────────────────
@@ -485,6 +664,13 @@ fn main() {
         WI_BLOCK_SIZE,
     );
     output.extend_from_slice(&compressed_wi);
+
+    // ── 6. Reading trie ─────────────────────────────────────────────
+    eprintln!("\nBuilding reading trie...");
+    let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
+    let reading_trie_section =
+        build_reading_trie_section(&output, output_lexicon_offset, has_synonym_group_ids);
+    output.extend_from_slice(&reading_trie_section);
 
     // ── Write output ────────────────────────────────────────────────
     fs::write(output_path, &output).unwrap_or_else(|e| {
