@@ -78,13 +78,15 @@ jobs:
               "system_${variant}.dic" \
               "system_${variant}_marisa.dic"
 
-            # ── KKC-optimized dictionary (Julia-adjusted costs) ──
+            # ── KKC-optimized dictionary (Julia-adjusted costs + matrix patches) ──
             ./target/release/kkc_builder --export "system_${variant}_marisa.dic" "words_${variant}.csv"
             julia julia/kkc_costs.jl "words_${variant}.csv" "workdir_${variant}"
+            julia julia/matrix_patches.jl "words_${variant}.csv" "workdir_${variant}/matrix_patches.csv"
             ./target/release/dic_converter \
               "system_${variant}.dic" \
               "system_${variant}_kkc.dic" \
-              --cost-csv "workdir_${variant}/adjusted.csv"
+              --cost-csv "workdir_${variant}/adjusted.csv" \
+              --matrix-patches "workdir_${variant}/matrix_patches.csv"
 
             # Cleanup intermediates
             rm -f dict.zip "system_${variant}.dic" "words_${variant}.csv"
