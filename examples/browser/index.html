@@ -38,6 +38,18 @@
     .view-tab.active { background: #fff; border-bottom-color: #fff; font-weight: bold; color: #000; }
     #furigana-style { display: none; }
     .furigana-active #furigana-style { display: inline-block; }
+    /* KKC candidates panel */
+    #kkc-candidates { margin-top: .8rem; }
+    .kkc-morph { margin-bottom: .5rem; }
+    .kkc-morph-label { font-size: .8rem; color: #888; margin-bottom: .2rem; }
+    .kkc-chips { display: flex; flex-wrap: wrap; gap: .3rem; }
+    .kkc-chip {
+      font-size: 1rem; padding: .2rem .55rem;
+      border: 1px solid #aaa; border-radius: 4px;
+      background: #f5f5f5; cursor: default;
+    }
+    .kkc-chip.best { background: #d6eaff; border-color: #4a90d9; font-weight: bold; }
+    .kkc-chip .chip-cost { font-size: .7rem; color: #888; margin-left: .3rem; }
   </style>
 </head>
 <body>
@@ -74,6 +86,7 @@
   </div>
 
   <div id="furigana-box" hidden></div>
+  <div id="kkc-candidates" hidden></div>
 
   <table id="tbl" hidden>
     <thead>
@@ -334,11 +347,14 @@
     function renderFurigana(morphemes) {
       lastMorphemes = morphemes;
       const style = document.getElementById("furigana-style").value;
+      const kkcMode = document.getElementById("kkc").checked;
       const alignErrors = [];
 
       const html = morphemes.map(m => {
+        // In KKC mode: show dictionaryForm (kanji) as the surface output.
+        // The user typed hiragana; the tokenizer resolved it to a dictionary form.
+        const surface = kkcMode ? m.dictionaryForm : m.surface;
         const reading = katakanaToHiragana(m.readingForm);
-        const surface = m.surface;
 
         // No kanji or reading identical to surface — plain text
         if (!containsKanji(surface) || reading === surface) {
@@ -347,10 +363,8 @@
 
         try {
           const segs = alignFurigana(surface, reading);
-          // alignFurigana returns null when surface has no kanji (already guarded above)
           return renderSegments(segs, style);
         } catch (e) {
-          // Alignment failed — record for error report and fall back to whole-word furigana
           alignErrors.push({ surface, reading });
           const s = escapeHtml(surface);
           const r = escapeHtml(reading);
@@ -391,9 +405,49 @@
       document.getElementById("tbl").hidden = (currentView !== "table");
     }
 
+    /** Render KKC candidates panel: for each morpheme, show ranked surface candidates. */
+    function renderKkcCandidates(morphemes) {
+      const panel = document.getElementById("kkc-candidates");
+      panel.innerHTML = "";
+
+      morphemes.forEach(m => {
+        const reading = katakanaToHiragana(m.readingForm);
+        // Skip trivial morphemes (punctuation, single-char kana particles, etc.)
+        if (!reading || reading.length === 0) return;
+
+        /** @type {Array<{surface,dictionaryForm,readingForm,partOfSpeech,cost}>} */
+        const candidates = tokenizer.lookup_by_reading(reading);
+        if (!candidates || candidates.length === 0) return;
+
+        const wrap = document.createElement("div");
+        wrap.className = "kkc-morph";
+
+        const label = document.createElement("div");
+        label.className = "kkc-morph-label";
+        label.textContent = `${reading} →`;
+        wrap.appendChild(label);
+
+        const chips = document.createElement("div");
+        chips.className = "kkc-chips";
+        candidates.forEach((c, i) => {
+          const chip = document.createElement("span");
+          chip.className = "kkc-chip" + (i === 0 ? " best" : "");
+          chip.title = `${c.partOfSpeech.filter(p => p !== "*").join(" › ")}  cost: ${c.cost}`;
+          chip.innerHTML = escapeHtml(c.surface) +
+            `<span class="chip-cost">${c.cost}</span>`;
+          chips.appendChild(chip);
+        });
+        wrap.appendChild(chips);
+        panel.appendChild(wrap);
+      });
+
+      panel.hidden = (panel.children.length === 0);
+    }
+
     function analyze() {
       const text = document.getElementById("text").value.trim();
       const mode = document.getElementById("mode").value;
+      const kkcMode = document.getElementById("kkc").checked;
       if (!text) return;
 
       /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
@@ -401,6 +455,11 @@
 
       renderFurigana(morphemes);
       renderTable(morphemes);
+      if (kkcMode) {
+        renderKkcCandidates(morphemes);
+      } else {
+        document.getElementById("kkc-candidates").hidden = true;
+      }
       document.getElementById("view-tabs").hidden = false;
     }
 

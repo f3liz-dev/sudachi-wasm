@@ -22,6 +22,8 @@ use wasm_bindgen::prelude::*;
 use sudachi::analysis::stateless_tokenizer::StatelessTokenizer;
 use sudachi::analysis::Tokenize;
 use sudachi::dic::dictionary::JapaneseDictionary;
+use sudachi::dic::subset::InfoSubset;
+use sudachi::kana::hiragana_to_katakana;
 use sudachi::prelude::*;
 
 /// Install a panic hook that forwards Rust panics to `console.error` in JS.
@@ -41,6 +43,24 @@ fn parse_mode(s: &str) -> Mode {
         "B" => Mode::B,
         _ => Mode::C,
     }
+}
+
+/// A single KKC candidate returned from [`Tokenizer::lookup_by_reading`].
+///
+/// Candidates are sorted by `cost` (ascending — lower cost = higher priority).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KkcCandidate {
+    /// Surface form (the kanji/kana spelling to display as conversion result).
+    surface: String,
+    /// Dictionary (base) form — the lemma this surface inflects from.
+    dictionary_form: String,
+    /// Reading in katakana.
+    reading_form: String,
+    /// Part-of-speech components.
+    part_of_speech: Vec<String>,
+    /// Word cost (lower = preferred by the language model).
+    cost: i16,
 }
 
 /// A single morpheme returned from [`Tokenizer::tokenize`].
@@ -128,5 +148,55 @@ impl Tokenizer {
             .collect();
 
         serde_wasm_bindgen::to_value(&morphemes).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Look up all dictionary entries whose reading matches `hiragana` and return
+    /// them as a ranked list of KKC candidates.
+    ///
+    /// This is the core of KKC (Kana-Kanji Conversion): given a hiragana reading,
+    /// enumerate every word in the dictionary that has that reading, then sort by
+    /// word cost so the most likely kanji surface appears first.
+    ///
+    /// @param hiragana - Hiragana reading to look up (e.g. `"あめ"`).
+    /// @returns Array of `{ surface, dictionaryForm, readingForm, partOfSpeech, cost }`
+    ///          sorted by cost ascending (lower = higher priority).
+    ///
+    /// ```js
+    /// const candidates = tokenizer.lookup_by_reading("あめ");
+    /// // → [{ surface: "雨", dictionaryForm: "雨", cost: 5432, … },
+    /// //    { surface: "飴", dictionaryForm: "飴", cost: 6789, … }, …]
+    /// ```
+    pub fn lookup_by_reading(&self, hiragana: &str) -> Result<JsValue, JsError> {
+        let dict = self.inner.as_dict();
+        let katakana = hiragana_to_katakana(hiragana);
+        let lexicon = dict.lexicon();
+        let grammar = dict.grammar();
+
+        let mut seen_surfaces = std::collections::HashSet::new();
+        let mut candidates: Vec<KkcCandidate> = lexicon
+            .lookup_by_reading(&katakana)
+            .filter_map(|word_id| {
+                let info = lexicon
+                    .get_word_info_subset(word_id, InfoSubset::all())
+                    .ok()?;
+                let (_, _, cost) = lexicon.get_word_param(word_id);
+                let surface = info.surface().to_string();
+                if seen_surfaces.contains(&surface) {
+                    return None;
+                }
+                seen_surfaces.insert(surface.clone());
+                Some(KkcCandidate {
+                    surface,
+                    dictionary_form: info.dictionary_form().to_string(),
+                    reading_form: info.reading_form().to_string(),
+                    part_of_speech: grammar.pos_components(info.pos_id()).to_vec(),
+                    cost,
+                })
+            })
+            .collect();
+
+        candidates.sort_by_key(|c| c.cost);
+
+        serde_wasm_bindgen::to_value(&candidates).map_err(|e| JsError::new(&e.to_string()))
     }
 }
