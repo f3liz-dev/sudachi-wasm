@@ -340,20 +340,33 @@
 
     // Re-render furigana when style selector changes
     let lastMorphemes = null;
+    let lastKkcCandidates = null; // Array<Array<candidate>> | null, parallel to lastMorphemes
     document.getElementById("furigana-style").addEventListener("change", () => {
-      if (lastMorphemes) renderFurigana(lastMorphemes);
+      if (lastMorphemes) renderFurigana(lastMorphemes, lastKkcCandidates);
     });
 
-    function renderFurigana(morphemes) {
+    /**
+     * In KKC mode, resolve the best kanji surface for a morpheme by looking up its
+     * reading in the dictionary. The top candidate's surface gives the correctly
+     * inflected kanji form (e.g. はたらか → 働か, not the base form 働く).
+     * Falls back to m.surface if no candidates are found.
+     */
+    function kkcSurface(m, candidates) {
+      if (!candidates || candidates.length === 0) return m.surface;
+      return candidates[0].surface;
+    }
+
+    function renderFurigana(morphemes, kkcCandidates) {
       lastMorphemes = morphemes;
+      lastKkcCandidates = kkcCandidates;
       const style = document.getElementById("furigana-style").value;
       const kkcMode = document.getElementById("kkc").checked;
       const alignErrors = [];
 
-      const html = morphemes.map(m => {
-        // In KKC mode: show dictionaryForm (kanji) as the surface output.
-        // The user typed hiragana; the tokenizer resolved it to a dictionary form.
-        const surface = kkcMode ? m.dictionaryForm : m.surface;
+      const html = morphemes.map((m, i) => {
+        // In KKC mode: use the top reading-lookup candidate's surface — this gives
+        // the kanji-inflected form (e.g. 働か) rather than the base/normalized form.
+        const surface = kkcMode ? kkcSurface(m, kkcCandidates && kkcCandidates[i]) : m.surface;
         const reading = katakanaToHiragana(m.readingForm);
 
         // No kanji or reading identical to surface — plain text
@@ -387,36 +400,50 @@
       }
     }
 
-    function renderTable(morphemes) {
+    function renderTable(morphemes, kkcCandidates) {
       const tbody = document.querySelector("#tbl tbody");
+      const kkcMode = document.getElementById("kkc").checked;
+      document.querySelector("#tbl thead tr").innerHTML = kkcMode
+        ? "<th>#</th><th>KKC output</th><th>Input (surface)</th><th>Reading</th><th>Dictionary form</th><th>Part of speech</th><th>Offsets</th>"
+        : "<th>#</th><th>Surface</th><th>Reading</th><th>Dictionary form</th><th>Normalized form</th><th>Part of speech</th><th>Offsets</th>";
       tbody.innerHTML = "";
       morphemes.forEach((m, i) => {
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${i + 1}</td>
-          <td><b>${escapeHtml(m.surface)}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
-          <td>${escapeHtml(m.readingForm)}</td>
-          <td>${escapeHtml(m.dictionaryForm)}</td>
-          <td>${escapeHtml(m.normalizedForm)}</td>
-          <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
-          <td>[${m.begin}, ${m.end})</td>`;
+        if (kkcMode) {
+          const kkc = escapeHtml(kkcSurface(m, kkcCandidates && kkcCandidates[i]));
+          tr.innerHTML = `
+            <td>${i + 1}</td>
+            <td><b>${kkc}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
+            <td>${escapeHtml(m.surface)}</td>
+            <td>${escapeHtml(m.readingForm)}</td>
+            <td>${escapeHtml(m.dictionaryForm)}</td>
+            <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
+            <td>[${m.begin}, ${m.end})</td>`;
+        } else {
+          tr.innerHTML = `
+            <td>${i + 1}</td>
+            <td><b>${escapeHtml(m.surface)}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
+            <td>${escapeHtml(m.readingForm)}</td>
+            <td>${escapeHtml(m.dictionaryForm)}</td>
+            <td>${escapeHtml(m.normalizedForm)}</td>
+            <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
+            <td>[${m.begin}, ${m.end})</td>`;
+        }
         tbody.appendChild(tr);
       });
       document.getElementById("tbl").hidden = (currentView !== "table");
     }
 
     /** Render KKC candidates panel: for each morpheme, show ranked surface candidates. */
-    function renderKkcCandidates(morphemes) {
+    function renderKkcCandidates(morphemes, kkcCandidates) {
       const panel = document.getElementById("kkc-candidates");
       panel.innerHTML = "";
 
-      morphemes.forEach(m => {
+      morphemes.forEach((m, i) => {
         const reading = katakanaToHiragana(m.readingForm);
-        // Skip trivial morphemes (punctuation, single-char kana particles, etc.)
         if (!reading || reading.length === 0) return;
 
-        /** @type {Array<{surface,dictionaryForm,readingForm,partOfSpeech,cost}>} */
-        const candidates = tokenizer.lookup_by_reading(reading);
+        const candidates = kkcCandidates[i];
         if (!candidates || candidates.length === 0) return;
 
         const wrap = document.createElement("div");
@@ -429,9 +456,9 @@
 
         const chips = document.createElement("div");
         chips.className = "kkc-chips";
-        candidates.forEach((c, i) => {
+        candidates.forEach((c, j) => {
           const chip = document.createElement("span");
-          chip.className = "kkc-chip" + (i === 0 ? " best" : "");
+          chip.className = "kkc-chip" + (j === 0 ? " best" : "");
           chip.title = `${c.partOfSpeech.filter(p => p !== "*").join(" › ")}  cost: ${c.cost}`;
           chip.innerHTML = escapeHtml(c.surface) +
             `<span class="chip-cost">${c.cost}</span>`;
@@ -453,10 +480,21 @@
       /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
       const morphemes = tokenizer.tokenize(text, mode);
 
-      renderFurigana(morphemes);
-      renderTable(morphemes);
+      // In KKC mode, compute ranked candidates for every morpheme once and share
+      // the result between furigana rendering, the table, and the candidates panel.
+      let kkcCandidates = null;
       if (kkcMode) {
-        renderKkcCandidates(morphemes);
+        kkcCandidates = morphemes.map(m => {
+          const reading = katakanaToHiragana(m.readingForm);
+          if (!reading) return [];
+          return tokenizer.lookup_by_reading(reading) || [];
+        });
+      }
+
+      renderFurigana(morphemes, kkcCandidates);
+      renderTable(morphemes, kkcCandidates);
+      if (kkcMode) {
+        renderKkcCandidates(morphemes, kkcCandidates);
       } else {
         document.getElementById("kkc-candidates").hidden = true;
       }
