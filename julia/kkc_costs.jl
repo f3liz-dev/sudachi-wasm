@@ -16,14 +16,22 @@ For IME KKC, we want:
 3. **POS weighting**: 名詞,動詞,形容詞 > 助詞,助動詞 for standalone conversion
 4. **Reading ambiguity**: readings with fewer candidates get a bonus
    (less ambiguous → user more likely means exactly that)
+5. **Script consistency**: reading/surface script mismatch → heavy penalty
+6. **Length ratio**: reading/surface length ratio extremes → penalty
+7. **Hiragana identity**: single-char hiragana surface → penalty
 
 The adjusted cost formula:
 
     C_ime(w) = C_orig(w)
-             + δ_freq(w)         # frequency rank adjustment
+             + δ_freq(w)         # frequency rank adjustment (with tied ranks)
              + δ_pos(w)          # POS category adjustment
              + δ_ambiguity(w)    # reading ambiguity penalty/bonus
              - δ_length(w)       # length preference boost
+             + δ_script(w)       # script mismatch penalty
+             + δ_ratio(w)        # surface/reading length ratio penalty
+             + δ_hiragana(w)     # single-char hiragana penalty
+
+    adjusted = max(adjusted, 100)  # cost floor to prevent 0-cost entries
 
 Usage:
     julia kkc_costs.jl <input.csv> <output_dir>
@@ -53,6 +61,31 @@ const POS_ADJUSTMENTS = Dict{String, Int}(
     "補助記号" => 300,   # Supplementary symbols: strongly penalize
     "空白"   => 500,     # Whitespace: heavily penalize
 )
+
+# Minimum adjusted cost — prevents entries from collapsing to 0
+const COST_FLOOR = 100
+
+# ─── Script Detection Helpers ────────────────────────────────────────────────
+
+function is_latin_char(c::Char)
+    'A' ≤ c ≤ 'Z' || 'a' ≤ c ≤ 'z' || 'Ａ' ≤ c ≤ 'Ｚ' || 'ａ' ≤ c ≤ 'ｚ'
+end
+
+function is_hiragana_char(c::Char)
+    'ぁ' ≤ c ≤ 'ゖ'
+end
+
+function is_katakana_char(c::Char)
+    'ァ' ≤ c ≤ 'ヶ'
+end
+
+function is_kana_char(c::Char)
+    is_hiragana_char(c) || is_katakana_char(c)
+end
+
+is_all_latin(s::AbstractString) = !isempty(s) && all(is_latin_char, s)
+is_all_hiragana(s::AbstractString) = !isempty(s) && all(is_hiragana_char, s)
+is_all_kana(s::AbstractString) = !isempty(s) && all(is_kana_char, s)
 
 # ─── Data Types ──────────────────────────────────────────────────────────────
 
@@ -250,7 +283,8 @@ Apply IME cost adjustments to each entry:
 
 1. **δ_freq**: Rank-based adjustment within each reading group.
    Within entries sharing the same reading, sort by original cost;
-   the top-ranked entry gets a bonus, lower-ranked get penalties.
+   entries with the same cost share a rank (tied-rank handling).
+   The top-ranked entry gets a bonus, lower-ranked get penalties.
 
 2. **δ_pos**: POS category adjustment from POS_ADJUSTMENTS table.
 
@@ -259,7 +293,18 @@ Apply IME cost adjustments to each entry:
 
 4. **δ_length**: Longer surface forms get boosted to prefer compounds.
 
-5. **α/β**: Derive compound boost and identity penalty from the data.
+5. **δ_script**: Script mismatch penalty — kana reading with Latin surface
+   gets a heavy penalty (prevents DEATH for です).
+
+6. **δ_ratio**: Surface/reading length ratio penalty — extreme ratios
+   (e.g. 5-char Latin for 2-char kana) are penalized.
+
+7. **δ_hiragana**: Single-char hiragana surfaces are penalized to prefer
+   kanji conversions.
+
+8. **Cost floor**: `max(adjusted, COST_FLOOR)` prevents zero-cost entries.
+
+9. **α/β**: Derive compound boost and identity penalty from the data.
 """
 function compute_adjusted_costs(entries::Vector{WordEntry})
     # ── Reading ambiguity map ──
@@ -283,12 +328,26 @@ function compute_adjusted_costs(entries::Vector{WordEntry})
         sorted_indices = sort(indices, by=i -> entries[i].cost)
         n_group = length(sorted_indices)
 
-        for (rank, idx) in enumerate(sorted_indices)
+        # --- Tied-rank assignment ---
+        # Entries with the same cost share the same rank.
+        ranks = Vector{Int}(undef, n_group)
+        if n_group > 0
+            ranks[1] = 1
+            for k in 2:n_group
+                if entries[sorted_indices[k]].cost == entries[sorted_indices[k-1]].cost
+                    ranks[k] = ranks[k-1]  # same cost → same rank
+                else
+                    ranks[k] = k            # new rank at this position
+                end
+            end
+        end
+
+        for (pos_in_group, idx) in enumerate(sorted_indices)
             e = entries[idx]
             cost = Int(e.cost)
+            rank = ranks[pos_in_group]
 
             # δ_freq: rank-based adjustment within reading group
-            # Top candidate gets bonus, others get progressive penalty
             if n_group > 1
                 # Normalize rank to [0, 1], where 0 = best
                 rank_ratio = (rank - 1) / (n_group - 1)
@@ -313,11 +372,26 @@ function compute_adjusted_costs(entries::Vector{WordEntry})
             end
 
             # δ_length: surface length preference
-            # Longer entries get boosted (prefer compounds)
             δ_len = -50 * max(0, e.char_count - 1)
 
+            # δ_script: script mismatch penalty
+            reading_is_kana = is_all_kana(e.reading_hiragana)
+            surface_is_latin = is_all_latin(e.surface)
+            δ_script = (reading_is_kana && surface_is_latin) ? 6000 : 0
+
+            # δ_ratio: surface/reading length ratio penalty
+            r_len = length(e.reading_hiragana)
+            s_len = length(e.surface)
+            δ_ratio = (r_len > 0 && s_len / r_len > 2.5) ? 2000 : 0
+
+            # δ_hiragana: single-char hiragana surface penalty
+            δ_hiragana = (is_all_hiragana(e.surface) && e.char_count == 1) ? 800 : 0
+
             # Apply all adjustments
-            adjusted = cost + δ_freq + δ_pos + δ_ambi + δ_len
+            adjusted = cost + δ_freq + δ_pos + δ_ambi + δ_len + δ_script + δ_ratio + δ_hiragana
+
+            # Cost floor: prevent zero/negative cost entries
+            adjusted = max(adjusted, COST_FLOOR)
 
             # Clamp to i16 range
             adjusted_costs[idx] = Int16(clamp(adjusted, typemin(Int16), typemax(Int16)))
@@ -325,8 +399,6 @@ function compute_adjusted_costs(entries::Vector{WordEntry})
     end
 
     # ── Derive α and β ──
-    # α: per-extra-character compound boost
-    # Compare cost savings between 1-char and 2-char entries
     costs_1 = Float64[entries[i].cost for i in 1:length(entries) if entries[i].char_count == 1]
     costs_2 = Float64[entries[i].cost for i in 1:length(entries) if entries[i].char_count == 2]
 
@@ -337,8 +409,6 @@ function compute_adjusted_costs(entries::Vector{WordEntry})
         500
     end
 
-    # β: identity penalty
-    # Set above 95th percentile of single-char costs
     β = if !isempty(costs_1)
         round(Int, clamp(quantile(costs_1, 0.95) * 1.5, 8000, 20000))
     else

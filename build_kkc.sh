@@ -122,19 +122,38 @@ echo ""
 # ── Step 3: Julia cost optimization ──────────────────────────────────────────
 
 JULIA_SCRIPT="$JULIA_DIR/kkc_costs.jl"
+MATRIX_PATCH_SCRIPT="$JULIA_DIR/matrix_patches.jl"
 echo "─── Step 3: Running Julia cost optimizer ───"
 if command -v julia &>/dev/null && [ -f "$JULIA_SCRIPT" ]; then
     # Use jlmarisa project for dependencies (Statistics, Printf, Dates)
     JLMARISA_PROJECT="$SCRIPT_DIR/../jlmarisa"
     if [ -d "$JLMARISA_PROJECT" ]; then
-        julia --project="$JLMARISA_PROJECT" "$JULIA_SCRIPT" "$EXPORT_CSV" "$WORK_DIR"
+        JULIA_CMD="julia --project=$JLMARISA_PROJECT"
     else
-        julia "$JULIA_SCRIPT" "$EXPORT_CSV" "$WORK_DIR"
+        JULIA_CMD="julia"
     fi
+
+    # Step 3a: Cost optimization
+    $JULIA_CMD "$JULIA_SCRIPT" "$EXPORT_CSV" "$WORK_DIR"
     COST_CSV_FLAG="--cost-csv $WORK_DIR/adjusted.csv"
+
+    # Step 3b: Matrix patches
+    if [ -f "$MATRIX_PATCH_SCRIPT" ]; then
+        echo ""
+        echo "─── Step 3b: Generating matrix patches ───"
+        $JULIA_CMD "$MATRIX_PATCH_SCRIPT" "$EXPORT_CSV" "$WORK_DIR/matrix_patches.csv"
+        if [ -f "$WORK_DIR/matrix_patches.csv" ]; then
+            MATRIX_PATCH_FLAG="--matrix-patches $WORK_DIR/matrix_patches.csv"
+        else
+            MATRIX_PATCH_FLAG=""
+        fi
+    else
+        MATRIX_PATCH_FLAG=""
+    fi
 else
     echo "  Julia not found or kkc_costs.jl missing. Using original costs." >&2
     COST_CSV_FLAG=""
+    MATRIX_PATCH_FLAG=""
 fi
 echo ""
 
@@ -143,7 +162,7 @@ echo ""
 OUTPUT_DIC="$OUTPUT_DIR/system_${VARIANT}.dic"
 echo "─── Step 4: Converting dictionary (YADA → MARISA + RTRI) ───"
 # shellcheck disable=SC2086
-"$DIC_CONVERTER" "$SOURCE_DIC" "$OUTPUT_DIC" $COST_CSV_FLAG
+"$DIC_CONVERTER" "$SOURCE_DIC" "$OUTPUT_DIC" $COST_CSV_FLAG $MATRIX_PATCH_FLAG
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────

@@ -515,41 +515,119 @@ fn load_cost_csv(path: &str) -> HashMap<u32, i16> {
     costs
 }
 
+// ── Matrix patch loading ────────────────────────────────────────────────
+
+/// Load matrix patches from a Julia-generated CSV.
+///
+/// Returns a map from (left_id, right_id) → delta (i16).
+/// CSV format: left_id,right_id,delta
+fn load_matrix_patches(path: &str) -> HashMap<(u16, u16), i16> {
+    let file = fs::File::open(path).unwrap_or_else(|e| {
+        eprintln!("Failed to open matrix patches {}: {}", path, e);
+        process::exit(1);
+    });
+    let reader = BufReader::new(file);
+    let mut patches = HashMap::new();
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.unwrap();
+        if line_num == 0 {
+            continue; // skip header
+        }
+        let fields: Vec<&str> = line.splitn(4, ',').collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        if let (Ok(left_id), Ok(right_id), Ok(delta)) = (
+            fields[0].parse::<u16>(),
+            fields[1].parse::<u16>(),
+            fields[2].trim().parse::<i16>(),
+        ) {
+            patches.insert((left_id, right_id), delta);
+        }
+    }
+
+    eprintln!(
+        "  Loaded {} matrix patches from {}",
+        patches.len(),
+        path
+    );
+    patches
+}
+
+/// Apply matrix patches to the raw connection matrix buffer in-place.
+///
+/// The matrix is stored as i16 values at `matrix_start`, indexed as
+/// `matrix[right * num_left + left]`.
+fn apply_matrix_patches(
+    buf: &mut [u8],
+    matrix_start: usize,
+    num_left: usize,
+    num_right: usize,
+    patches: &HashMap<(u16, u16), i16>,
+) -> u32 {
+    let mut applied = 0u32;
+    for (&(left_id, right_id), &delta) in patches {
+        let li = left_id as usize;
+        let ri = right_id as usize;
+        if li >= num_left || ri >= num_right {
+            continue;
+        }
+        let idx = ri * num_left + li;
+        let pos = matrix_start + idx * 2;
+        let current = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+        let new_cost = (current as i32 + delta as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        buf[pos..pos + 2].copy_from_slice(&new_cost.to_le_bytes());
+        applied += 1;
+    }
+    applied
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Parse arguments: <input.dic> <output.dic> [--cost-csv <adjusted.csv>]
+    // Parse arguments: <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>]
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>]", args[0]);
+        eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>]", args[0]);
         eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
         eprintln!("with connection matrix and word_infos block compression.");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --cost-csv <path>  Apply Julia-optimized costs from CSV");
+        eprintln!("  --cost-csv <path>        Apply Julia-optimized costs from CSV");
+        eprintln!("  --matrix-patches <path>  Apply connection matrix patches from CSV");
         process::exit(1);
     }
 
     let input_path = &args[1];
     let output_path = &args[2];
 
-    // Parse optional --cost-csv flag
-    let cost_adjustments: Option<HashMap<u32, i16>> = {
-        let mut csv_path = None;
-        let mut i = 3;
-        while i < args.len() {
-            if args[i] == "--cost-csv" && i + 1 < args.len() {
-                csv_path = Some(args[i + 1].clone());
+    // Parse optional flags
+    let mut cost_csv_path: Option<String> = None;
+    let mut matrix_patches_path: Option<String> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cost-csv" if i + 1 < args.len() => {
+                cost_csv_path = Some(args[i + 1].clone());
                 i += 2;
-            } else {
+            }
+            "--matrix-patches" if i + 1 < args.len() => {
+                matrix_patches_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 process::exit(1);
             }
         }
-        csv_path.map(|p| load_cost_csv(&p))
-    };
+    }
+
+    let cost_adjustments: Option<HashMap<u32, i16>> = cost_csv_path.map(|p| load_cost_csv(&p));
+    let matrix_patches: Option<HashMap<(u16, u16), i16>> =
+        matrix_patches_path.map(|p| load_matrix_patches(&p));
 
     eprintln!("Reading {}...", input_path);
-    let buf = fs::read(input_path).unwrap_or_else(|e| {
+    let mut buf = fs::read(input_path).unwrap_or_else(|e| {
         eprintln!("Failed to read {}: {}", input_path, e);
         process::exit(1);
     });
@@ -578,6 +656,17 @@ fn main() {
 
         // Write POS list + left_id + right_id
         output.extend_from_slice(&pos_list_bytes);
+
+        // Apply matrix patches before compression
+        if let Some(ref patches) = matrix_patches {
+            let applied =
+                apply_matrix_patches(&mut buf, matrix_start, left_id, right_id, patches);
+            eprintln!(
+                "  Matrix patches: applied {}/{} patches",
+                applied,
+                patches.len()
+            );
+        }
 
         // Compress and write connection matrix
         let original_matrix_size = (matrix_end - matrix_start) as f64;
