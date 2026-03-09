@@ -20,6 +20,23 @@ const HEADER_SIZE: usize = 272;
 const BLOCK_SIZE: usize = 256;
 const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
 
+/// Convert katakana to hiragana (reverse of `hiragana_to_katakana`).
+///
+/// Maps U+30A1..U+30F6 (ァ..ヶ) → U+3041..U+3096 (ぁ..ゖ) by subtracting 0x60.
+/// All other characters are passed through unchanged.
+fn katakana_to_hiragana(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x30A1..=0x30F6).contains(&cp) {
+                char::from_u32(cp - 0x60).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 const SYSTEM_DICT_V1: u64 = 0x7366d3f18bd111e7;
 const SYSTEM_DICT_V2: u64 = 0xce9f011a92394434;
 const USER_DICT_V2: u64 = 0x9fdeb5a90168d868;
@@ -481,7 +498,75 @@ fn build_reading_trie_section(
     result
 }
 
-// ── Cost CSV loading ────────────────────────────────────────────────────
+/// Build reading-keyed MARISA trie + word_id table to replace the surface-keyed
+/// main lexicon sections.
+///
+/// This makes Viterbi operate on reading (hiragana) keys so that kanji candidates
+/// are selected during lattice search with full connection-cost awareness, rather
+/// than being applied in post-processing.
+///
+/// Returns `(marisa_trie_section, word_id_table_section)` where each section
+/// includes its size prefix, matching the format expected by `Lexicon::parse`.
+fn build_reading_keyed_sections(
+    dict_bytes: &[u8],
+    lexicon_offset: usize,
+    has_synonym_group_ids: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    use sudachi::dic::lexicon::Lexicon;
+    use std::collections::BTreeMap;
+
+    let lexicon = Lexicon::parse(dict_bytes, lexicon_offset, has_synonym_group_ids)
+        .expect("Failed to parse lexicon for reading-keyed rebuild");
+
+    // Collect hiragana reading → [raw_word_ids]
+    let mut reading_to_ids: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for (word_id, result) in lexicon.iter_reading_words() {
+        if let Ok(info) = result {
+            let reading_hira = katakana_to_hiragana(info.reading_form());
+            if !reading_hira.is_empty() {
+                reading_to_ids
+                    .entry(reading_hira)
+                    .or_default()
+                    .push(word_id.word());
+            }
+        }
+    }
+
+    eprintln!(
+        "  Reading-keyed trie: {} unique readings",
+        reading_to_ids.len()
+    );
+
+    // Build word_id table: [count: u8][word_ids: u32 × count] per reading
+    let mut word_id_table_data = Vec::new();
+    let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
+
+    for (reading, ids) in &reading_to_ids {
+        let offset = word_id_table_data.len() as u32;
+        let count = ids.len().min(255) as u8;
+        word_id_table_data.push(count);
+        for &wid in ids.iter().take(255) {
+            word_id_table_data.extend_from_slice(&wid.to_le_bytes());
+        }
+        entries.push((reading.as_bytes().to_vec(), offset));
+    }
+
+    // Build MARISA trie (reuses existing build_marisa_section)
+    let marisa_section = build_marisa_section(&entries);
+
+    // Format word_id table with u32 size prefix (matching Lexicon::parse expectation)
+    let mut wit_section = Vec::with_capacity(4 + word_id_table_data.len());
+    wit_section.extend_from_slice(&(word_id_table_data.len() as u32).to_le_bytes());
+    wit_section.extend_from_slice(&word_id_table_data);
+
+    eprintln!(
+        "  Reading-keyed MARISA: {} bytes, word_id_table: {} bytes",
+        marisa_section.len(),
+        wit_section.len()
+    );
+
+    (marisa_section, wit_section)
+}
 
 /// Load adjusted costs from a Julia-processed CSV.
 ///
@@ -711,6 +796,7 @@ fn main() {
     output.extend_from_slice(&buf[post_offset..wit_end]);
     post_offset = wit_end;
 
+    let output_word_params_offset = output.len();
     let word_params_size = read_u32_le(&buf, post_offset) as usize;
     let wp_data_start = post_offset + 4;
     let wp_end = wp_data_start + word_params_size * 6;
@@ -754,9 +840,28 @@ fn main() {
     );
     output.extend_from_slice(&compressed_wi);
 
-    // ── 6. Reading trie ─────────────────────────────────────────────
-    eprintln!("\nBuilding reading trie...");
+    // ── 6. Swap trie + word_id table to reading-keyed ──────────────
+    //
+    // Pass 2: replace the surface-keyed MARISA trie and word_id table with
+    // reading-keyed (hiragana) versions so Viterbi operates on readings.
+    eprintln!("\nSwapping lexicon trie to reading-keyed (hiragana)...");
     let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
+    let (reading_marisa, reading_wit) = build_reading_keyed_sections(
+        &output,
+        output_lexicon_offset,
+        has_synonym_group_ids,
+    );
+
+    // Reassemble: keep header+grammar, swap trie+wit, keep word_params+word_infos
+    let word_params_onward = output[output_word_params_offset..].to_vec();
+    output.truncate(output_lexicon_offset);
+    let output_lexicon_offset = output.len(); // recalculate after truncation
+    output.extend_from_slice(&reading_marisa);
+    output.extend_from_slice(&reading_wit);
+    output.extend_from_slice(&word_params_onward);
+
+    // ── 7. Reading trie (RTRI) for candidate lookup ─────────────────
+    eprintln!("\nBuilding reading trie (RTRI) for candidate lookup...");
     let reading_trie_section =
         build_reading_trie_section(&output, output_lexicon_offset, has_synonym_group_ids);
     output.extend_from_slice(&reading_trie_section);

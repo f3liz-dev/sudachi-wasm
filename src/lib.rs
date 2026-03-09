@@ -257,17 +257,13 @@ impl Tokenizer {
 
     /// Perform POS-aware Kana-Kanji Conversion on hiragana text.
     ///
-    /// This is the core KKC entry point. It tokenizes the input text, then for
-    /// each morpheme:
-    /// - **Functional POS** (助詞, 助動詞, 補助記号, etc.): kept as-is in hiragana.
-    ///   These are grammatical markers that are conventionally never written in kanji.
-    /// - **Content POS** (名詞, 動詞, 形容詞, etc.): looked up via the reading trie
-    ///   and the best candidate with matching POS is selected. This ensures e.g.
-    ///   きょう as 名詞 → 今日, not an unrelated rare kanji.
+    /// The dictionary's main trie is reading-keyed (hiragana), so the Viterbi
+    /// lattice search directly considers kanji candidates during segmentation
+    /// and path selection. Each morpheme's word_info surface is the kanji form
+    /// chosen by the language model (connection costs + word costs).
     ///
-    /// The approach mirrors mecab-as-kkc: the tokenizer's Viterbi lattice search
-    /// handles segmentation and POS assignment, then reading-based lookup with
-    /// POS filtering selects the kanji output.
+    /// Functional POS (助詞, 助動詞, etc.) naturally remain in hiragana because
+    /// their word_info surfaces are hiragana.
     ///
     /// @param text  - Hiragana input text to convert.
     /// @param mode  - Split mode: `"A"`, `"B"`, or `"C"` (default).
@@ -298,36 +294,19 @@ impl Tokenizer {
                 let surface = m.surface().to_string();
                 let reading = m.reading_form().to_string();
 
-                // Functional POS: keep original surface, no candidate lookup
-                if is_functional_pos(major_pos) {
-                    return KkcMorpheme {
-                        kkc_surface: surface.clone(),
-                        original_surface: surface,
-                        reading_form: reading,
-                        dictionary_form: m.dictionary_form().to_string(),
-                        normalized_form: m.normalized_form().to_string(),
-                        part_of_speech: pos.to_vec(),
-                        is_oov: m.is_oov(),
-                        candidates: vec![],
-                        begin: m.begin_c(),
-                        end: m.end_c(),
-                    };
-                }
+                // Viterbi-selected kanji surface from word_info
+                let kkc_surface = if m.is_oov() {
+                    surface.clone()
+                } else {
+                    m.get_word_info().surface().to_string()
+                };
 
-                // Content POS: lookup candidates by reading, prefer POS match
-                let candidates = collect_kkc_candidates(lexicon, grammar, &reading);
-
-                let kkc_surface = candidates
-                    .iter()
-                    .find(|c| {
-                        c.part_of_speech
-                            .first()
-                            .map(|s| s.as_str())
-                            == Some(major_pos)
-                    })
-                    .or(candidates.first())
-                    .map(|c| c.surface.clone())
-                    .unwrap_or_else(|| surface.clone());
+                // Candidates for interactive selection (via RTRI)
+                let candidates = if is_functional_pos(major_pos) {
+                    vec![]
+                } else {
+                    collect_kkc_candidates(lexicon, grammar, &reading)
+                };
 
                 KkcMorpheme {
                     kkc_surface,
