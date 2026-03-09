@@ -429,6 +429,286 @@ fn build_kkc_dict(csv_path: &str, params_path: &str, output_path: &str) {
     );
 }
 
+// ─── KKC Adjust Mode ────────────────────────────────────────────────────────
+//
+// POS-based cost adjustment in Rust (replaces Julia kkc_costs.jl when unavailable).
+// Follows the mecab-as-kkc philosophy: adjust word costs so common content words
+// are preferred, functional words are penalized, and reading ambiguity is considered.
+
+/// POS-based cost delta: negative = prefer, positive = penalize.
+fn pos_cost_delta(pos_str: &str) -> i32 {
+    let major = pos_str.split('-').next().unwrap_or("");
+    match major {
+        "名詞" => -200,   // nouns — strongly prefer for KKC
+        "動詞" => -150,   // verbs — prefer
+        "形容詞" => -100, // adjectives — prefer
+        "形状詞" => -80,  // na-adjectives — prefer
+        "副詞" => -50,    // adverbs — slight prefer
+        "連体詞" => -30,  // adnominals
+        "代名詞" => -50,  // pronouns
+        "助詞" => 200,    // particles — penalize (usually kept as hiragana)
+        "助動詞" => 200,  // auxiliary verbs — penalize
+        "記号" => 300,    // symbols — strongly penalize
+        "補助記号" => 300, // supplementary symbols
+        "感動詞" => 100,  // interjections — mild penalize
+        "接続詞" => 100,  // conjunctions — mild penalize
+        _ => 0,
+    }
+}
+
+/// Check if a surface contains only katakana (ァ-ヶー).
+fn is_all_katakana(s: &str) -> bool {
+    s.chars().all(|c| {
+        ('\u{30A1}'..='\u{30F6}').contains(&c)
+            || c == '\u{30FC}' // ー
+            || c == '\u{30F3}' // ン (already in range but explicit)
+    })
+}
+
+/// Check if a surface contains only hiragana (ぁ-ん).
+fn is_all_hiragana(s: &str) -> bool {
+    s.chars()
+        .all(|c| ('\u{3041}'..='\u{3096}').contains(&c) || c == '\u{30FC}')
+}
+
+/// Check if surface contains Latin/ASCII characters.
+fn contains_latin(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Apply POS-aware cost adjustments to exported CSV, producing an adjusted CSV.
+///
+/// This implements a subset of what kkc_costs.jl does:
+/// 1. POS-based cost delta (nouns preferred, particles penalized)
+/// 2. Script-mismatch penalty (hiragana reading → Latin surface)
+/// 3. Frequency rank within reading group (common entries get bonus)
+/// 4. Single-hiragana penalty (prevents は→者 type conversions)
+/// 5. Reading ambiguity bonus (unambiguous readings get boost)
+///
+/// Also generates params.json with α (compound boost) and β (identity penalty).
+fn kkc_adjust(input_csv: &str, output_dir: &str) {
+    eprintln!("Running Rust-based KKC cost adjustment...");
+
+    let file = fs::File::open(input_csv).unwrap_or_else(|e| {
+        eprintln!("Failed to open {}: {}", input_csv, e);
+        process::exit(1);
+    });
+    let reader = BufReader::new(file);
+
+    // Parse all entries
+    struct Entry {
+        word_id: String,
+        reading_h: String,
+        reading_k: String,
+        surface: String,
+        cost: i32,
+        left_id: String,
+        right_id: String,
+        pos_id: String,
+        pos_str: String,
+        char_count: String,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.unwrap();
+        if i == 0 {
+            continue;
+        }
+        let fields = parse_csv_line(&line);
+        if fields.len() < 10 {
+            continue;
+        }
+        let cost: i32 = match fields[4].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        entries.push(Entry {
+            word_id: fields[0].clone(),
+            reading_h: fields[1].clone(),
+            reading_k: fields[2].clone(),
+            surface: fields[3].clone(),
+            cost,
+            left_id: fields[5].clone(),
+            right_id: fields[6].clone(),
+            pos_id: fields[7].clone(),
+            pos_str: fields[8].clone(),
+            char_count: fields[9].clone(),
+        });
+    }
+
+    eprintln!("  Loaded {} entries", entries.len());
+
+    // Group entries by reading for frequency ranking
+    let mut reading_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        reading_groups
+            .entry(e.reading_h.clone())
+            .or_default()
+            .push(i);
+    }
+
+    // Apply cost adjustments
+    let mut adjusted_costs: Vec<i32> = entries.iter().map(|e| e.cost).collect();
+    let mut stats = [0i64; 4]; // [pos_adjusted, script_penalized, freq_adjusted, hiragana_penalized]
+
+    for (reading, indices) in &reading_groups {
+        let group_size = indices.len();
+
+        // Sort within group by original cost for frequency ranking
+        let mut sorted_indices: Vec<usize> = indices.clone();
+        sorted_indices.sort_by_key(|&i| entries[i].cost);
+
+        for (rank, &idx) in sorted_indices.iter().enumerate() {
+            let e = &entries[idx];
+            let mut delta: i32 = 0;
+
+            // 1. POS-based delta
+            let pos_delta = pos_cost_delta(&e.pos_str);
+            if pos_delta != 0 {
+                delta += pos_delta;
+                stats[0] += 1;
+            }
+
+            // 2. Script-mismatch penalty: hiragana reading → Latin/katakana surface
+            if contains_latin(&e.surface) {
+                delta += 6000;
+                stats[1] += 1;
+            } else if is_all_katakana(&e.surface) && !is_all_katakana(&e.reading_k) {
+                // Katakana surface for a non-katakana word (e.g., デス for です)
+                delta += 1000;
+                stats[1] += 1;
+            }
+
+            // 3. Frequency rank within reading group
+            if group_size > 1 {
+                if rank == 0 {
+                    delta -= 300; // top entry gets bonus
+                } else if rank == group_size - 1 {
+                    delta += 200; // worst entry gets penalty
+                } else {
+                    // Linear interpolation between bonus and penalty
+                    let frac = rank as f64 / (group_size - 1) as f64;
+                    delta += (-300.0 + 500.0 * frac) as i32;
+                }
+                stats[2] += 1;
+            }
+
+            // 4. Reading ambiguity bonus: unambiguous readings get boost
+            if group_size <= 3 {
+                delta -= 100;
+            }
+
+            // 5. Single-character reading penalty: prevent は→者, ね→眠 etc.
+            //    Penalize entries where a single-char hiragana reading maps to kanji.
+            if reading.chars().count() == 1 && !is_all_hiragana(&e.surface) {
+                delta += 800;
+                stats[3] += 1;
+            }
+
+            // 6. Surface/reading length ratio penalty
+            let surf_len = e.surface.chars().count() as f64;
+            let read_len = reading.chars().count().max(1) as f64;
+            if surf_len / read_len > 2.5 {
+                delta += 2000;
+            }
+
+            let new_cost = (e.cost + delta).max(100);
+            adjusted_costs[idx] = new_cost;
+        }
+    }
+
+    eprintln!(
+        "  Adjustments: POS={}, script={}, freq={}, hiragana={}",
+        stats[0], stats[1], stats[2], stats[3]
+    );
+
+    // Compute α and β parameters
+    // α: compound boost — estimated from median single-char vs multi-char cost ratio
+    let single_char_costs: Vec<i32> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.surface.chars().count() == 1)
+        .map(|(i, _)| adjusted_costs[i])
+        .collect();
+    let multi_char_costs: Vec<i32> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.surface.chars().count() >= 2)
+        .map(|(i, _)| adjusted_costs[i])
+        .collect();
+
+    let alpha = if !single_char_costs.is_empty() && !multi_char_costs.is_empty() {
+        let mut sc = single_char_costs.clone();
+        let mut mc = multi_char_costs.clone();
+        sc.sort();
+        mc.sort();
+        let median_s = sc[sc.len() / 2];
+        let median_m = mc[mc.len() / 2];
+        (median_s - median_m).max(100).min(2000) as i16
+    } else {
+        500i16
+    };
+
+    // β: identity penalty — 95th percentile of single-char costs
+    let beta = if !single_char_costs.is_empty() {
+        let mut sc = single_char_costs;
+        sc.sort();
+        let p95_idx = (sc.len() as f64 * 0.95) as usize;
+        sc[p95_idx.min(sc.len() - 1)].min(i16::MAX as i32) as i16
+    } else {
+        12000i16
+    };
+
+    // Write adjusted CSV
+    let adjusted_path = format!("{}/adjusted.csv", output_dir);
+    let mut out = std::io::BufWriter::new(
+        fs::File::create(&adjusted_path).unwrap_or_else(|e| {
+            eprintln!("Failed to create {}: {}", adjusted_path, e);
+            process::exit(1);
+        }),
+    );
+
+    writeln!(
+        out,
+        "word_id,reading_hiragana,reading_katakana,surface,cost,left_id,right_id,pos_id,pos_str,char_count"
+    )
+    .unwrap();
+
+    for (i, e) in entries.iter().enumerate() {
+        writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{},{}",
+            e.word_id,
+            csv_escape(&e.reading_h),
+            csv_escape(&e.reading_k),
+            csv_escape(&e.surface),
+            adjusted_costs[i],
+            e.left_id,
+            e.right_id,
+            e.pos_id,
+            csv_escape(&e.pos_str),
+            e.char_count,
+        )
+        .unwrap();
+    }
+    drop(out);
+    eprintln!("  Wrote adjusted costs to {}", adjusted_path);
+
+    // Write params.json
+    let params_path = format!("{}/params.json", output_dir);
+    let params_content = format!(
+        "{{\n  \"alpha\": {},\n  \"beta\": {}\n}}\n",
+        alpha, beta
+    );
+    fs::write(&params_path, params_content).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {}", params_path, e);
+        process::exit(1);
+    });
+    eprintln!("  Parameters: α={}, β={}", alpha, beta);
+    eprintln!("  Wrote parameters to {}", params_path);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -457,6 +737,16 @@ fn main() {
             }
             build_kkc_dict(&args[2], &args[3], &args[4]);
         }
+        "--kkc-adjust" => {
+            if args.len() != 4 {
+                eprintln!(
+                    "Usage: {} --kkc-adjust <words_export.csv> <output_dir>",
+                    args[0]
+                );
+                process::exit(1);
+            }
+            kkc_adjust(&args[2], &args[3]);
+        }
         _ => {
             print_usage(&args[0]);
             process::exit(1);
@@ -476,4 +766,11 @@ fn print_usage(prog: &str) {
         prog
     );
     eprintln!("    Build KKC dictionary from Julia-adjusted CSV and parameters");
+    eprintln!();
+    eprintln!(
+        "  {} --kkc-adjust <words_export.csv> <output_dir>",
+        prog
+    );
+    eprintln!("    Apply POS-based cost adjustment in Rust (Julia-free alternative)");
+    eprintln!("    Outputs: adjusted.csv + params.json in output_dir");
 }

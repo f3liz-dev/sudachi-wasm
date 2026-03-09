@@ -123,8 +123,9 @@ echo ""
 
 JULIA_SCRIPT="$JULIA_DIR/kkc_costs.jl"
 MATRIX_PATCH_SCRIPT="$JULIA_DIR/matrix_patches.jl"
-echo "─── Step 3: Running Julia cost optimizer ───"
+echo "─── Step 3: Running cost optimizer ───"
 if command -v julia &>/dev/null && [ -f "$JULIA_SCRIPT" ]; then
+    echo "  Using Julia cost optimizer"
     # Use jlmarisa project for dependencies (Statistics, Printf, Dates)
     JLMARISA_PROJECT="$SCRIPT_DIR/../jlmarisa"
     if [ -d "$JLMARISA_PROJECT" ]; then
@@ -151,8 +152,9 @@ if command -v julia &>/dev/null && [ -f "$JULIA_SCRIPT" ]; then
         MATRIX_PATCH_FLAG=""
     fi
 else
-    echo "  Julia not found or kkc_costs.jl missing. Using original costs." >&2
-    COST_CSV_FLAG=""
+    echo "  Julia not found. Using Rust-based KKC cost adjustment."
+    "$KKC_BUILDER" --kkc-adjust "$EXPORT_CSV" "$WORK_DIR"
+    COST_CSV_FLAG="--cost-csv $WORK_DIR/adjusted.csv"
     MATRIX_PATCH_FLAG=""
 fi
 echo ""

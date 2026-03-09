@@ -345,14 +345,51 @@
       if (lastMorphemes) renderFurigana(lastMorphemes, lastKkcCandidates);
     });
 
+    // POS major categories that should NOT be converted to kanji.
+    // These are functional/grammatical words conventionally written in hiragana.
+    // (Mirrors the Rust-side is_functional_pos() for non-kkc_convert code paths.)
+    const KKC_KEEP_SURFACE_POS = new Set([
+      '助詞',     // particles (は、が、を、の、に、へ、で、ね、よ)
+      '助動詞',   // auxiliary verbs (です、ます、た、だ、ない)
+      '補助記号', // supplementary punctuation (。、、)
+      '記号',     // symbols
+      '空白',     // whitespace
+      '接続詞',   // conjunctions (しかし、そして — usually kana)
+      '感動詞',   // interjections (ああ、おお)
+    ]);
+
     /**
      * In KKC mode, resolve the best kanji surface for a morpheme by looking up its
-     * reading in the dictionary. The top candidate's surface gives the correctly
-     * inflected kanji form (e.g. はたらか → 働か, not the base form 働く).
-     * Falls back to m.surface if no candidates are found.
+     * reading in the dictionary, respecting part-of-speech constraints.
+     *
+     * - Functional POS (particles, auxiliaries, etc.) are kept as-is (hiragana).
+     * - Content POS (nouns, verbs, adjectives) prefer candidates whose major POS
+     *   matches the morpheme's POS for better accuracy.
      */
     function kkcSurface(m, candidates) {
+      // If the Rust-side kkc_convert already determined the surface, use it
+      if (m._kkcSurface != null) {
+        return m._kkcSurface;
+      }
+
+      const majorPos = m.partOfSpeech[0];
+
+      // Functional words: keep original surface (never convert to kanji)
+      if (KKC_KEEP_SURFACE_POS.has(majorPos)) {
+        return m.surface;
+      }
+
       if (!candidates || candidates.length === 0) return m.surface;
+
+      // Content words: prefer candidates with matching major POS
+      const posMatched = candidates.filter(c =>
+        c.partOfSpeech && c.partOfSpeech.length > 0 && c.partOfSpeech[0] === majorPos
+      );
+      if (posMatched.length > 0) {
+        return posMatched[0].surface;
+      }
+
+      // Fall back to best overall candidate
       return candidates[0].surface;
     }
 
@@ -477,25 +514,37 @@
       const kkcMode = document.getElementById("kkc").checked;
       if (!text) return;
 
-      /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
-      const morphemes = tokenizer.tokenize(text, mode);
-
-      // In KKC mode, compute ranked candidates for every morpheme once and share
-      // the result between furigana rendering, the table, and the candidates panel.
-      let kkcCandidates = null;
       if (kkcMode) {
-        kkcCandidates = morphemes.map(m => {
-          const reading = katakanaToHiragana(m.readingForm);
-          if (!reading) return [];
-          return tokenizer.lookup_by_reading(reading) || [];
-        });
-      }
+        // Use the Rust-side kkc_convert() which performs POS-aware conversion:
+        // - Tokenizes the input via Sudachi's Viterbi lattice search
+        // - Skips conversion for functional POS (助詞, 助動詞, etc.)
+        // - For content POS, looks up candidates by reading and filters by POS
+        /** @type {Array<{kkcSurface,originalSurface,readingForm,dictionaryForm,normalizedForm,partOfSpeech,isOov,candidates,begin,end}>} */
+        const kkcResult = tokenizer.kkc_convert(text, mode);
 
-      renderFurigana(morphemes, kkcCandidates);
-      renderTable(morphemes, kkcCandidates);
-      if (kkcMode) {
+        // Adapt KKC result to the morpheme interface expected by renderers
+        const morphemes = kkcResult.map(m => ({
+          surface: m.originalSurface,
+          dictionaryForm: m.dictionaryForm,
+          readingForm: m.readingForm,
+          normalizedForm: m.normalizedForm,
+          partOfSpeech: m.partOfSpeech,
+          isOov: m.isOov,
+          begin: m.begin,
+          end: m.end,
+          // KKC-specific: the converted surface
+          _kkcSurface: m.kkcSurface,
+        }));
+        const kkcCandidates = kkcResult.map(m => m.candidates || []);
+
+        renderFurigana(morphemes, kkcCandidates);
+        renderTable(morphemes, kkcCandidates);
         renderKkcCandidates(morphemes, kkcCandidates);
       } else {
+        /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
+        const morphemes = tokenizer.tokenize(text, mode);
+        renderFurigana(morphemes, null);
+        renderTable(morphemes, null);
         document.getElementById("kkc-candidates").hidden = true;
       }
       document.getElementById("view-tabs").hidden = false;
