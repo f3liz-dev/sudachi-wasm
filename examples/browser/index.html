@@ -38,18 +38,6 @@
     .view-tab.active { background: #fff; border-bottom-color: #fff; font-weight: bold; color: #000; }
     #furigana-style { display: none; }
     .furigana-active #furigana-style { display: inline-block; }
-    /* KKC candidates panel */
-    #kkc-candidates { margin-top: .8rem; }
-    .kkc-morph { margin-bottom: .5rem; }
-    .kkc-morph-label { font-size: .8rem; color: #888; margin-bottom: .2rem; }
-    .kkc-chips { display: flex; flex-wrap: wrap; gap: .3rem; }
-    .kkc-chip {
-      font-size: 1rem; padding: .2rem .55rem;
-      border: 1px solid #aaa; border-radius: 4px;
-      background: #f5f5f5; cursor: default;
-    }
-    .kkc-chip.best { background: #d6eaff; border-color: #4a90d9; font-weight: bold; }
-    .kkc-chip .chip-cost { font-size: .7rem; color: #888; margin-left: .3rem; }
   </style>
 </head>
 <body>
@@ -65,9 +53,6 @@
       <option value="core" selected>Core dict</option>
       <option value="full">Full dict</option>
     </select>
-    <label title="Use KKC-optimized dictionary (Julia-adjusted costs for IME use)">
-      <input id="kkc" type="checkbox" /> KKC
-    </label>
     <select id="mode" title="Split mode">
       <option value="C" selected>C – named entity (longest)</option>
       <option value="B">B – word level</option>
@@ -86,7 +71,6 @@
   </div>
 
   <div id="furigana-box" hidden></div>
-  <div id="kkc-candidates" hidden></div>
 
   <table id="tbl" hidden>
     <thead>
@@ -256,10 +240,9 @@
     }
 
     /** Fetch a dictionary variant (cached). Returns Uint8Array. */
-    async function fetchDict(variant, kkc) {
-      const key = kkc ? `${variant}_kkc` : variant;
-      if (dictCache.has(key)) return dictCache.get(key);
-      const filename = kkc ? `system_${variant}_kkc.dic` : `system_${variant}.dic`;
+    async function fetchDict(variant) {
+      if (dictCache.has(variant)) return dictCache.get(variant);
+      const filename = `system_${variant}.dic`;
       const resp = await fetch(filename);
       if (!resp.ok) throw new Error(`Failed to fetch ${filename}: ${resp.status}`);
       const total = parseInt(resp.headers.get("content-length") || "0", 10);
@@ -272,55 +255,49 @@
         chunks.push(value);
         received += value.length;
         const label = { small: "Small", core: "Core", full: "Full" }[variant];
-        const suffix = kkc ? " KKC" : "";
         if (total > 0) {
           const pct = Math.round((received / total) * 100);
-          setStatus(`⏳ Downloading ${label}${suffix} dictionary… ${pct}%`);
+          setStatus(`⏳ Downloading ${label} dictionary… ${pct}%`);
           setProgress(received / total);
         } else {
-          setStatus(`⏳ Downloading ${label}${suffix} dictionary… ${(received / 1048576).toFixed(1)} MB`);
+          setStatus(`⏳ Downloading ${label} dictionary… ${(received / 1048576).toFixed(1)} MB`);
         }
       }
       // Merge chunks into a single Uint8Array
       const bytes = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-      dictCache.set(key, bytes);
+      dictCache.set(variant, bytes);
       return bytes;
     }
 
     /** Load (or switch to) a dictionary variant, rebuilding the tokenizer. */
-    async function loadDict(variant, kkc) {
-      const key = kkc ? `${variant}_kkc` : variant;
-      if (loadedDictVariant === key) return;
+    async function loadDict(variant) {
+      if (loadedDictVariant === variant) return;
       document.getElementById("btn").disabled = true;
       const label = { small: "Small", core: "Core", full: "Full" }[variant];
-      const suffix = kkc ? " KKC" : "";
-      setStatus(`⏳ Loading ${label}${suffix} dictionary…`);
-      const bytes = await fetchDict(variant, kkc);
+      setStatus(`⏳ Loading ${label} dictionary…`);
+      const bytes = await fetchDict(variant);
       setStatus(`⏳ Building tokenizer…`);
       setProgress(null);
       tokenizer = new Tokenizer(bytes);
-      loadedDictVariant = key;
-      setStatus(`✅ Ready (${label}${suffix} dictionary)`);
+      loadedDictVariant = variant;
+      setStatus(`✅ Ready (${label} dictionary)`);
       document.getElementById("btn").disabled = false;
     }
 
     async function setup() {
       await init();
       const initialVariant = document.getElementById("dict").value;
-      const kkc = document.getElementById("kkc").checked;
-      await loadDict(initialVariant, kkc);
+      await loadDict(initialVariant);
     }
 
-    // Reload tokenizer when dictionary selector or KKC toggle changes
+    // Reload tokenizer when dictionary selector changes
     function reloadDict() {
       const variant = document.getElementById("dict").value;
-      const kkc = document.getElementById("kkc").checked;
-      loadDict(variant, kkc).catch(err => setStatus(`❌ ${err.message}`));
+      loadDict(variant).catch(err => setStatus(`❌ ${err.message}`));
     }
     document.getElementById("dict").addEventListener("change", reloadDict);
-    document.getElementById("kkc").addEventListener("change", reloadDict);
 
     // View tab switching
     let currentView = "furigana";
@@ -340,70 +317,17 @@
 
     // Re-render furigana when style selector changes
     let lastMorphemes = null;
-    let lastKkcCandidates = null; // Array<Array<candidate>> | null, parallel to lastMorphemes
     document.getElementById("furigana-style").addEventListener("change", () => {
-      if (lastMorphemes) renderFurigana(lastMorphemes, lastKkcCandidates);
+      if (lastMorphemes) renderFurigana(lastMorphemes);
     });
 
-    // POS major categories that should NOT be converted to kanji.
-    // These are functional/grammatical words conventionally written in hiragana.
-    // (Mirrors the Rust-side is_functional_pos() for non-kkc_convert code paths.)
-    const KKC_KEEP_SURFACE_POS = new Set([
-      '助詞',     // particles (は、が、を、の、に、へ、で、ね、よ)
-      '助動詞',   // auxiliary verbs (です、ます、た、だ、ない)
-      '補助記号', // supplementary punctuation (。、、)
-      '記号',     // symbols
-      '空白',     // whitespace
-      '接続詞',   // conjunctions (しかし、そして — usually kana)
-      '感動詞',   // interjections (ああ、おお)
-    ]);
-
-    /**
-     * In KKC mode, resolve the best kanji surface for a morpheme by looking up its
-     * reading in the dictionary, respecting part-of-speech constraints.
-     *
-     * - Functional POS (particles, auxiliaries, etc.) are kept as-is (hiragana).
-     * - Content POS (nouns, verbs, adjectives) prefer candidates whose major POS
-     *   matches the morpheme's POS for better accuracy.
-     */
-    function kkcSurface(m, candidates) {
-      // If the Rust-side kkc_convert already determined the surface, use it
-      if (m._kkcSurface != null) {
-        return m._kkcSurface;
-      }
-
-      const majorPos = m.partOfSpeech[0];
-
-      // Functional words: keep original surface (never convert to kanji)
-      if (KKC_KEEP_SURFACE_POS.has(majorPos)) {
-        return m.surface;
-      }
-
-      if (!candidates || candidates.length === 0) return m.surface;
-
-      // Content words: prefer candidates with matching major POS
-      const posMatched = candidates.filter(c =>
-        c.partOfSpeech && c.partOfSpeech.length > 0 && c.partOfSpeech[0] === majorPos
-      );
-      if (posMatched.length > 0) {
-        return posMatched[0].surface;
-      }
-
-      // Fall back to best overall candidate
-      return candidates[0].surface;
-    }
-
-    function renderFurigana(morphemes, kkcCandidates) {
+    function renderFurigana(morphemes) {
       lastMorphemes = morphemes;
-      lastKkcCandidates = kkcCandidates;
       const style = document.getElementById("furigana-style").value;
-      const kkcMode = document.getElementById("kkc").checked;
       const alignErrors = [];
 
-      const html = morphemes.map((m, i) => {
-        // In KKC mode: use the top reading-lookup candidate's surface — this gives
-        // the kanji-inflected form (e.g. 働か) rather than the base/normalized form.
-        const surface = kkcMode ? kkcSurface(m, kkcCandidates && kkcCandidates[i]) : m.surface;
+      const html = morphemes.map((m) => {
+        const surface = m.surface;
         const reading = katakanaToHiragana(m.readingForm);
 
         // No kanji or reading identical to surface — plain text
@@ -437,116 +361,34 @@
       }
     }
 
-    function renderTable(morphemes, kkcCandidates) {
+    function renderTable(morphemes) {
       const tbody = document.querySelector("#tbl tbody");
-      const kkcMode = document.getElementById("kkc").checked;
-      document.querySelector("#tbl thead tr").innerHTML = kkcMode
-        ? "<th>#</th><th>KKC output</th><th>Input (surface)</th><th>Reading</th><th>Dictionary form</th><th>Part of speech</th><th>Offsets</th>"
-        : "<th>#</th><th>Surface</th><th>Reading</th><th>Dictionary form</th><th>Normalized form</th><th>Part of speech</th><th>Offsets</th>";
+      document.querySelector("#tbl thead tr").innerHTML =
+        "<th>#</th><th>Surface</th><th>Reading</th><th>Dictionary form</th><th>Normalized form</th><th>Part of speech</th><th>Offsets</th>";
       tbody.innerHTML = "";
       morphemes.forEach((m, i) => {
         const tr = document.createElement("tr");
-        if (kkcMode) {
-          const kkc = escapeHtml(kkcSurface(m, kkcCandidates && kkcCandidates[i]));
-          tr.innerHTML = `
-            <td>${i + 1}</td>
-            <td><b>${kkc}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
-            <td>${escapeHtml(m.surface)}</td>
-            <td>${escapeHtml(m.readingForm)}</td>
-            <td>${escapeHtml(m.dictionaryForm)}</td>
-            <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
-            <td>[${m.begin}, ${m.end})</td>`;
-        } else {
-          tr.innerHTML = `
-            <td>${i + 1}</td>
-            <td><b>${escapeHtml(m.surface)}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
-            <td>${escapeHtml(m.readingForm)}</td>
-            <td>${escapeHtml(m.dictionaryForm)}</td>
-            <td>${escapeHtml(m.normalizedForm)}</td>
-            <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
-            <td>[${m.begin}, ${m.end})</td>`;
-        }
+        tr.innerHTML = `
+          <td>${i + 1}</td>
+          <td><b>${escapeHtml(m.surface)}</b>${m.isOov ? ' <span class="oov">OOV</span>' : ""}</td>
+          <td>${escapeHtml(m.readingForm)}</td>
+          <td>${escapeHtml(m.dictionaryForm)}</td>
+          <td>${escapeHtml(m.normalizedForm)}</td>
+          <td class="pos">${m.partOfSpeech.map(escapeHtml).join(" › ")}</td>
+          <td>[${m.begin}, ${m.end})</td>`;
         tbody.appendChild(tr);
       });
       document.getElementById("tbl").hidden = (currentView !== "table");
     }
 
-    /** Render KKC candidates panel: for each morpheme, show ranked surface candidates. */
-    function renderKkcCandidates(morphemes, kkcCandidates) {
-      const panel = document.getElementById("kkc-candidates");
-      panel.innerHTML = "";
-
-      morphemes.forEach((m, i) => {
-        const reading = katakanaToHiragana(m.readingForm);
-        if (!reading || reading.length === 0) return;
-
-        const candidates = kkcCandidates[i];
-        if (!candidates || candidates.length === 0) return;
-
-        const wrap = document.createElement("div");
-        wrap.className = "kkc-morph";
-
-        const label = document.createElement("div");
-        label.className = "kkc-morph-label";
-        label.textContent = `${reading} →`;
-        wrap.appendChild(label);
-
-        const chips = document.createElement("div");
-        chips.className = "kkc-chips";
-        candidates.forEach((c, j) => {
-          const chip = document.createElement("span");
-          chip.className = "kkc-chip" + (j === 0 ? " best" : "");
-          chip.title = `${c.partOfSpeech.filter(p => p !== "*").join(" › ")}  cost: ${c.cost}`;
-          chip.innerHTML = escapeHtml(c.surface) +
-            `<span class="chip-cost">${c.cost}</span>`;
-          chips.appendChild(chip);
-        });
-        wrap.appendChild(chips);
-        panel.appendChild(wrap);
-      });
-
-      panel.hidden = (panel.children.length === 0);
-    }
-
     function analyze() {
       const text = document.getElementById("text").value.trim();
       const mode = document.getElementById("mode").value;
-      const kkcMode = document.getElementById("kkc").checked;
       if (!text) return;
 
-      if (kkcMode) {
-        // Use the Rust-side kkc_convert() which performs POS-aware conversion:
-        // - Tokenizes the input via Sudachi's Viterbi lattice search
-        // - Skips conversion for functional POS (助詞, 助動詞, etc.)
-        // - For content POS, looks up candidates by reading and filters by POS
-        /** @type {Array<{kkcSurface,originalSurface,readingForm,dictionaryForm,normalizedForm,partOfSpeech,isOov,candidates,begin,end}>} */
-        const kkcResult = tokenizer.kkc_convert(text, mode);
-
-        // Adapt KKC result to the morpheme interface expected by renderers
-        const morphemes = kkcResult.map(m => ({
-          surface: m.originalSurface,
-          dictionaryForm: m.dictionaryForm,
-          readingForm: m.readingForm,
-          normalizedForm: m.normalizedForm,
-          partOfSpeech: m.partOfSpeech,
-          isOov: m.isOov,
-          begin: m.begin,
-          end: m.end,
-          // KKC-specific: the converted surface
-          _kkcSurface: m.kkcSurface,
-        }));
-        const kkcCandidates = kkcResult.map(m => m.candidates || []);
-
-        renderFurigana(morphemes, kkcCandidates);
-        renderTable(morphemes, kkcCandidates);
-        renderKkcCandidates(morphemes, kkcCandidates);
-      } else {
-        /** @type {Array<{surface,dictionaryForm,readingForm,normalizedForm,partOfSpeech,isOov,begin,end}>} */
-        const morphemes = tokenizer.tokenize(text, mode);
-        renderFurigana(morphemes, null);
-        renderTable(morphemes, null);
-        document.getElementById("kkc-candidates").hidden = true;
-      }
+      const morphemes = tokenizer.tokenize(text, mode);
+      renderFurigana(morphemes);
+      renderTable(morphemes);
       document.getElementById("view-tabs").hidden = false;
     }
 

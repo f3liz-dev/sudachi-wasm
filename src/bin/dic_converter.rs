@@ -673,13 +673,14 @@ fn main() {
 
     // Parse arguments: <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>]
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>]", args[0]);
+        eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>] [--reading-keyed]", args[0]);
         eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
         eprintln!("with connection matrix and word_infos block compression.");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --cost-csv <path>        Apply Julia-optimized costs from CSV");
         eprintln!("  --matrix-patches <path>  Apply connection matrix patches from CSV");
+        eprintln!("  --reading-keyed          Swap main trie to reading-keyed (hiragana) for KKC use");
         process::exit(1);
     }
 
@@ -689,6 +690,7 @@ fn main() {
     // Parse optional flags
     let mut cost_csv_path: Option<String> = None;
     let mut matrix_patches_path: Option<String> = None;
+    let mut reading_keyed = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -699,6 +701,10 @@ fn main() {
             "--matrix-patches" if i + 1 < args.len() => {
                 matrix_patches_path = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--reading-keyed" => {
+                reading_keyed = true;
+                i += 1;
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
@@ -840,31 +846,42 @@ fn main() {
     );
     output.extend_from_slice(&compressed_wi);
 
-    // ── 6. Swap trie + word_id table to reading-keyed ──────────────
+    // ── 6. Swap trie + word_id table to reading-keyed (KKC only) ──────
     //
-    // Pass 2: replace the surface-keyed MARISA trie and word_id table with
-    // reading-keyed (hiragana) versions so Viterbi operates on readings.
-    eprintln!("\nSwapping lexicon trie to reading-keyed (hiragana)...");
-    let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
-    let (reading_marisa, reading_wit) = build_reading_keyed_sections(
-        &output,
-        output_lexicon_offset,
-        has_synonym_group_ids,
-    );
+    // Only when --reading-keyed is set: replace the surface-keyed MARISA trie
+    // and word_id table with reading-keyed (hiragana) versions so Viterbi
+    // operates on readings. Without this flag, the trie remains surface-keyed
+    // for normal tokenization of kanji/kana text.
+    if reading_keyed {
+        eprintln!("\nSwapping lexicon trie to reading-keyed (hiragana)...");
+        let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
+        let (reading_marisa, reading_wit) = build_reading_keyed_sections(
+            &output,
+            output_lexicon_offset,
+            has_synonym_group_ids,
+        );
 
-    // Reassemble: keep header+grammar, swap trie+wit, keep word_params+word_infos
-    let word_params_onward = output[output_word_params_offset..].to_vec();
-    output.truncate(output_lexicon_offset);
-    let output_lexicon_offset = output.len(); // recalculate after truncation
-    output.extend_from_slice(&reading_marisa);
-    output.extend_from_slice(&reading_wit);
-    output.extend_from_slice(&word_params_onward);
+        // Reassemble: keep header+grammar, swap trie+wit, keep word_params+word_infos
+        let word_params_onward = output[output_word_params_offset..].to_vec();
+        output.truncate(output_lexicon_offset);
+        let output_lexicon_offset = output.len(); // recalculate after truncation
+        output.extend_from_slice(&reading_marisa);
+        output.extend_from_slice(&reading_wit);
+        output.extend_from_slice(&word_params_onward);
 
-    // ── 7. Reading trie (RTRI) for candidate lookup ─────────────────
-    eprintln!("\nBuilding reading trie (RTRI) for candidate lookup...");
-    let reading_trie_section =
-        build_reading_trie_section(&output, output_lexicon_offset, has_synonym_group_ids);
-    output.extend_from_slice(&reading_trie_section);
+        // ── 7. Reading trie (RTRI) for candidate lookup ─────────────────
+        eprintln!("\nBuilding reading trie (RTRI) for candidate lookup...");
+        let reading_trie_section =
+            build_reading_trie_section(&output, output_lexicon_offset, has_synonym_group_ids);
+        output.extend_from_slice(&reading_trie_section);
+    } else {
+        // ── 7. Reading trie (RTRI) for candidate lookup ─────────────────
+        eprintln!("\nBuilding reading trie (RTRI) for candidate lookup...");
+        let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
+        let reading_trie_section =
+            build_reading_trie_section(&output, output_lexicon_offset, has_synonym_group_ids);
+        output.extend_from_slice(&reading_trie_section);
+    }
 
     // ── Write output ────────────────────────────────────────────────
     fs::write(output_path, &output).unwrap_or_else(|e| {
