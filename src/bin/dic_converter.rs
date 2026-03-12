@@ -1,8 +1,8 @@
-//! Dictionary converter: YADA → MARISA with compact encoding.
+//! Dictionary converter: YADA → MARISA with mixed compression.
 //!
 //! Reads a standard Sudachi `.dic` file and writes a new `.dic` file with:
 //! 1. MARISA trie index (replacing YADA double-array trie)
-//! 2. Bit-packed connection matrix (per-block min+bitwidth packing)
+//! 2. Block-compressed connection matrix (zstd, 256×256 blocks)
 //! 3. VByte-encoded word_infos (variable-byte integer/array fields)
 //!
 //! Usage:
@@ -17,10 +17,12 @@ use std::io::{BufRead, BufReader};
 use std::process;
 
 use sudachi::dic::compact;
+#[cfg(not(target_arch = "wasm32"))]
+use zstd::bulk;
 
 const HEADER_SIZE: usize = 272;
 const BLOCK_SIZE: usize = 256;
-const BITPACKED_MAGIC: u32 = 0x4D43_4250; // "MCBP" — bit-packed blocks
+const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB" — zstd-compressed blocks
 
 /// Convert katakana to hiragana (reverse of `hiragana_to_katakana`).
 ///
@@ -70,10 +72,7 @@ fn has_grammar(version: u64) -> bool {
 // ── Grammar section parsing ─────────────────────────────────────────────
 
 /// Parse grammar section, returning (pos_list_bytes, left_id, right_id, matrix_start, matrix_end).
-fn parse_grammar(
-    buf: &[u8],
-    grammar_offset: usize,
-) -> (Vec<u8>, usize, usize, usize, usize) {
+fn parse_grammar(buf: &[u8], grammar_offset: usize) -> (Vec<u8>, usize, usize, usize, usize) {
     let mut off = grammar_offset;
     let pos_count = read_u16_le(buf, off) as usize;
     off += 2;
@@ -104,26 +103,24 @@ fn parse_grammar(
     (pos_list_bytes, left_id, right_id, matrix_start, matrix_end)
 }
 
-/// Bit-pack the connection matrix into 256×256 blocks.
+/// Compress the connection matrix into 256×256 zstd blocks.
 ///
-/// Each block stores a minimum value and a bit-width, then packs
-/// `(value - min)` for every cell using exactly `bit_width` bits.
-/// This allows O(1) random access at runtime without decompression.
+/// Raw i16 matrix cells are grouped into blocks, a zstd dictionary is trained
+/// from the full set of blocks, and then each block is compressed with that
+/// dictionary. Unlike the removed MCZD format, this stores plain values rather
+/// than row deltas.
 ///
 /// Output format:
 /// ```text
-/// [BITPACKED_MAGIC: u32]
+/// [COMPRESSED_MAGIC: u32]
 /// [num_left: u16][num_right: u16]
 /// [num_blocks: u32]
-/// [block_offsets: u32 × num_blocks]
-/// [block_data: ...]
+/// [dict_size: u32]
+/// [dictionary: u8 × dict_size]
+/// [block_index: (offset: u32, compressed_size: u32) × num_blocks]
+/// [compressed_block_data: ...]
 /// ```
-///
-/// Each block:
-/// ```text
-/// [min_val: i16][bit_width: u8][packed_data: ...]
-/// ```
-fn bitpack_connection_matrix(
+fn compress_connection_matrix(
     buf: &[u8],
     matrix_start: usize,
     num_left: usize,
@@ -133,78 +130,56 @@ fn bitpack_connection_matrix(
     let num_col_blocks = (num_left + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let num_blocks = num_row_blocks * num_col_blocks;
 
-    // Collect all blocks' packed data
-    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-
+    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
     for rb in 0..num_row_blocks {
         for cb in 0..num_col_blocks {
-            let row_start = rb * BLOCK_SIZE;
-            let row_end = std::cmp::min(row_start + BLOCK_SIZE, num_right);
-            let col_start = cb * BLOCK_SIZE;
-            let col_end = std::cmp::min(col_start + BLOCK_SIZE, num_left);
-            let actual_rows = row_end - row_start;
-            let actual_cols = col_end - col_start;
-            let num_cells = actual_rows * actual_cols;
-
-            // Read all values in this block
-            let mut values = Vec::with_capacity(num_cells);
-            let mut min_val: i16 = i16::MAX;
-            let mut max_val: i16 = i16::MIN;
-            for r in row_start..row_end {
-                for c in col_start..col_end {
+            let mut block_data = Vec::new();
+            for r in (rb * BLOCK_SIZE)..std::cmp::min((rb + 1) * BLOCK_SIZE, num_right) {
+                for c in (cb * BLOCK_SIZE)..std::cmp::min((cb + 1) * BLOCK_SIZE, num_left) {
                     let idx = r * num_left + c;
                     let pos = matrix_start + idx * 2;
-                    let val = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
-                    values.push(val);
-                    if val < min_val {
-                        min_val = val;
-                    }
-                    if val > max_val {
-                        max_val = val;
-                    }
+                    block_data.extend_from_slice(&buf[pos..pos + 2]);
                 }
             }
-
-            // Compute bit width needed for (max - min)
-            let range = (max_val as i32 - min_val as i32) as u16;
-            let bit_width = compact::bits_needed(range);
-
-            // Pack values
-            let total_bits = num_cells * bit_width as usize;
-            let packed_bytes = (total_bits + 7) / 8;
-            let mut packed = vec![0u8; packed_bytes];
-
-            for (i, &val) in values.iter().enumerate() {
-                let offset_val = (val as i32 - min_val as i32) as u16;
-                compact::pack_bits(&mut packed, i * bit_width as usize, offset_val, bit_width);
-            }
-
-            // Build block: [min_val: i16][bit_width: u8][packed_data]
-            let mut block = Vec::with_capacity(3 + packed_bytes);
-            block.extend_from_slice(&min_val.to_le_bytes());
-            block.push(bit_width);
-            block.extend_from_slice(&packed);
-
-            block_data_vec.push(block);
+            samples.push(block_data);
         }
     }
 
-    // Build output
+    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
+    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
+    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
+        .expect("zstd dictionary training failed");
+    eprintln!(
+        "    Trained connection matrix dictionary: {} bytes",
+        dict.len()
+    );
+
+    let mut compressor = bulk::Compressor::with_dictionary(19, &dict)
+        .expect("failed to create compressor with dictionary");
+    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    for sample in &samples {
+        let compressed = compressor
+            .compress(sample)
+            .expect("zstd compression failed");
+        compressed_blocks.push(compressed);
+    }
+
     let mut result = Vec::new();
-    result.extend_from_slice(&BITPACKED_MAGIC.to_le_bytes());
+    result.extend_from_slice(&COMPRESSED_MAGIC.to_le_bytes());
     result.extend_from_slice(&(num_left as u16).to_le_bytes());
     result.extend_from_slice(&(num_right as u16).to_le_bytes());
     result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    result.extend_from_slice(&dict);
 
-    // Build block offset table
     let mut data_offset: u32 = 0;
-    for block in &block_data_vec {
+    for block in &compressed_blocks {
         result.extend_from_slice(&data_offset.to_le_bytes());
+        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
         data_offset += block.len() as u32;
     }
 
-    // Write block data
-    for block in &block_data_vec {
+    for block in &compressed_blocks {
         result.extend_from_slice(block);
     }
 
@@ -256,12 +231,7 @@ fn extract_yada_entries(array: &[u32]) -> Vec<(Vec<u8>, u32)> {
     results
 }
 
-fn yada_dfs(
-    array: &[u32],
-    node_pos: usize,
-    path: &mut Vec<u8>,
-    results: &mut Vec<(Vec<u8>, u32)>,
-) {
+fn yada_dfs(array: &[u32], node_pos: usize, path: &mut Vec<u8>, results: &mut Vec<(Vec<u8>, u32)>) {
     for k in 0u16..=255 {
         let child_pos = node_pos ^ (k as usize);
         if child_pos >= array.len() {
@@ -349,11 +319,7 @@ fn read_string_length(buf: &[u8], pos: usize) -> (usize, usize) {
 ///   normalized_form(str) dict_form_word_id(zigzag_vbyte) reading_form(str)
 ///   a_split(vbyte+vbyte[]) b_split(vbyte+vbyte[]) word_struct(vbyte+vbyte[])
 ///   [synonym_group_ids(vbyte+vbyte[])]
-fn vbyte_reencode_record(
-    record: &[u8],
-    has_synonym_group_ids: bool,
-    output: &mut Vec<u8>,
-) {
+fn vbyte_reencode_record(record: &[u8], has_synonym_group_ids: bool, output: &mut Vec<u8>) {
     let mut pos = 0;
 
     // surface: string → copy as-is
@@ -475,9 +441,9 @@ fn build_reading_trie_section(
     lexicon_offset: usize,
     has_synonym_group_ids: bool,
 ) -> Vec<u8> {
+    use std::collections::BTreeMap;
     use sudachi::dic::lexicon::Lexicon;
     use sudachi::kana::hiragana_to_katakana;
-    use std::collections::BTreeMap;
 
     const READING_TRIE_MAGIC: u32 = 0x5254_5249; // "RTRI"
 
@@ -535,8 +501,11 @@ fn build_reading_trie_section(
     }
 
     let mut writer = Writer::from_vec(Vec::new());
-    trie.write(&mut writer).expect("failed to serialize reading trie");
-    let trie_bytes = writer.into_inner().expect("failed to get reading trie bytes");
+    trie.write(&mut writer)
+        .expect("failed to serialize reading trie");
+    let trie_bytes = writer
+        .into_inner()
+        .expect("failed to get reading trie bytes");
 
     // Assemble RTRI section
     let mut result = Vec::new();
@@ -576,8 +545,8 @@ fn build_reading_keyed_sections(
     lexicon_offset: usize,
     has_synonym_group_ids: bool,
 ) -> (Vec<u8>, Vec<u8>) {
-    use sudachi::dic::lexicon::Lexicon;
     use std::collections::BTreeMap;
+    use sudachi::dic::lexicon::Lexicon;
 
     let lexicon = Lexicon::parse(dict_bytes, lexicon_offset, has_synonym_group_ids)
         .expect("Failed to parse lexicon for reading-keyed rebuild");
@@ -696,11 +665,7 @@ fn load_matrix_patches(path: &str) -> HashMap<(u16, u16), i16> {
         }
     }
 
-    eprintln!(
-        "  Loaded {} matrix patches from {}",
-        patches.len(),
-        path
-    );
+    eprintln!("  Loaded {} matrix patches from {}", patches.len(), path);
     patches
 }
 
@@ -725,7 +690,8 @@ fn apply_matrix_patches(
         let idx = ri * num_left + li;
         let pos = matrix_start + idx * 2;
         let current = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
-        let new_cost = (current as i32 + delta as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let new_cost =
+            (current as i32 + delta as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         buf[pos..pos + 2].copy_from_slice(&new_cost.to_le_bytes());
         applied += 1;
     }
@@ -739,12 +705,14 @@ fn main() {
     if args.len() < 3 {
         eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>] [--reading-keyed]", args[0]);
         eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
-        eprintln!("with connection matrix and word_infos block compression.");
+        eprintln!("with a zstd-compressed connection matrix and VByte-encoded word infos.");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --cost-csv <path>        Apply Julia-optimized costs from CSV");
         eprintln!("  --matrix-patches <path>  Apply connection matrix patches from CSV");
-        eprintln!("  --reading-keyed          Swap main trie to reading-keyed (hiragana) for KKC use");
+        eprintln!(
+            "  --reading-keyed          Swap main trie to reading-keyed (hiragana) for KKC use"
+        );
         process::exit(1);
     }
 
@@ -814,8 +782,7 @@ fn main() {
 
         // Apply matrix patches before compression
         if let Some(ref patches) = matrix_patches {
-            let applied =
-                apply_matrix_patches(&mut buf, matrix_start, left_id, right_id, patches);
+            let applied = apply_matrix_patches(&mut buf, matrix_start, left_id, right_id, patches);
             eprintln!(
                 "  Matrix patches: applied {}/{} patches",
                 applied,
@@ -823,16 +790,16 @@ fn main() {
             );
         }
 
-        // Bit-pack and write connection matrix
+        // Compress and write connection matrix
         let original_matrix_size = (matrix_end - matrix_start) as f64;
-        let bitpacked = bitpack_connection_matrix(&buf, matrix_start, left_id, right_id);
+        let compressed = compress_connection_matrix(&buf, matrix_start, left_id, right_id);
         eprintln!(
-            "  Connection matrix: {:.1} MB → {:.1} MB ({:.1}x ratio, bit-packed)",
+            "  Connection matrix: {:.1} MB → {:.1} MB ({:.1}x ratio, zstd)",
             original_matrix_size / 1024.0 / 1024.0,
-            bitpacked.len() as f64 / 1024.0 / 1024.0,
-            original_matrix_size / bitpacked.len() as f64
+            compressed.len() as f64 / 1024.0 / 1024.0,
+            original_matrix_size / compressed.len() as f64
         );
-        output.extend_from_slice(&bitpacked);
+        output.extend_from_slice(&compressed);
 
         lexicon_offset = matrix_end;
     } else {
@@ -889,7 +856,10 @@ fn main() {
             output.extend_from_slice(&right_id.to_le_bytes());
             output.extend_from_slice(&cost.to_le_bytes());
         }
-        eprintln!("  Word params: patched {}/{} costs from CSV", patched, word_params_size);
+        eprintln!(
+            "  Word params: patched {}/{} costs from CSV",
+            patched, word_params_size
+        );
     } else {
         // Copy word_params as-is
         output.extend_from_slice(&buf[post_offset..wp_end]);
@@ -901,7 +871,12 @@ fn main() {
     let original_wi_size = buf.len() - word_infos_start;
     let has_synonym_group_ids_flag = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
 
-    let vbyte_wi = vbyte_encode_word_infos(&buf, word_infos_start, word_params_size, has_synonym_group_ids_flag);
+    let vbyte_wi = vbyte_encode_word_infos(
+        &buf,
+        word_infos_start,
+        word_params_size,
+        has_synonym_group_ids_flag,
+    );
     eprintln!(
         "  Word infos: {:.1} MB → {:.1} MB ({:.1}x ratio, VByte-encoded)",
         original_wi_size as f64 / 1024.0 / 1024.0,
@@ -919,11 +894,8 @@ fn main() {
     if reading_keyed {
         eprintln!("\nSwapping lexicon trie to reading-keyed (hiragana)...");
         let has_synonym_group_ids = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
-        let (reading_marisa, reading_wit) = build_reading_keyed_sections(
-            &output,
-            output_lexicon_offset,
-            has_synonym_group_ids,
-        );
+        let (reading_marisa, reading_wit) =
+            build_reading_keyed_sections(&output, output_lexicon_offset, has_synonym_group_ids);
 
         // Reassemble: keep header+grammar, swap trie+wit, keep word_params+word_infos
         let word_params_onward = output[output_word_params_offset..].to_vec();
