@@ -1,9 +1,9 @@
-//! Dictionary converter: YADA → MARISA with compression.
+//! Dictionary converter: YADA → MARISA with compact encoding.
 //!
 //! Reads a standard Sudachi `.dic` file and writes a new `.dic` file with:
 //! 1. MARISA trie index (replacing YADA double-array trie)
-//! 2. Block-compressed connection matrix (zstd, 64×64 blocks)
-//! 3. Block-compressed word_infos (zstd, 64-record blocks)
+//! 2. Bit-packed connection matrix (per-block min+bitwidth packing)
+//! 3. VByte-encoded word_infos (variable-byte integer/array fields)
 //!
 //! Usage:
 //!   dic_converter <input.dic> <output.dic>
@@ -16,10 +16,11 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process;
 
+use sudachi::dic::compact;
+
 const HEADER_SIZE: usize = 272;
 const BLOCK_SIZE: usize = 256;
-const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
-const COMPRESSED_DELTA_MAGIC: u32 = 0x4D43_5A44; // "MCZD" — delta-encoded blocks
+const BITPACKED_MAGIC: u32 = 0x4D43_4250; // "MCBP" — bit-packed blocks
 
 /// Convert katakana to hiragana (reverse of `hiragana_to_katakana`).
 ///
@@ -103,26 +104,26 @@ fn parse_grammar(
     (pos_list_bytes, left_id, right_id, matrix_start, matrix_end)
 }
 
-/// Compress the connection matrix into 256×256 zstd blocks with row-delta encoding.
+/// Bit-pack the connection matrix into 256×256 blocks.
 ///
-/// Row-delta encoding: within each block, store the first column value as-is,
-/// then store deltas (current - previous) for subsequent columns. This exploits
-/// the correlation between adjacent connection costs for ~3x better compression.
-///
-/// A zstd dictionary is trained from all blocks and stored in the output
-/// so the decompressor can use it for better small-block compression.
+/// Each block stores a minimum value and a bit-width, then packs
+/// `(value - min)` for every cell using exactly `bit_width` bits.
+/// This allows O(1) random access at runtime without decompression.
 ///
 /// Output format:
 /// ```text
-/// [COMPRESSED_DELTA_MAGIC: u32]
+/// [BITPACKED_MAGIC: u32]
 /// [num_left: u16][num_right: u16]
 /// [num_blocks: u32]
-/// [dict_size: u32]
-/// [dictionary: u8 × dict_size]
-/// [block_index: (offset: u32, compressed_size: u32) × num_blocks]
-/// [compressed_block_data: ...]
+/// [block_offsets: u32 × num_blocks]
+/// [block_data: ...]
 /// ```
-fn compress_connection_matrix(
+///
+/// Each block:
+/// ```text
+/// [min_val: i16][bit_width: u8][packed_data: ...]
+/// ```
+fn bitpack_connection_matrix(
     buf: &[u8],
     matrix_start: usize,
     num_left: usize,
@@ -132,70 +133,78 @@ fn compress_connection_matrix(
     let num_col_blocks = (num_left + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let num_blocks = num_row_blocks * num_col_blocks;
 
-    // First pass: collect all delta-encoded blocks as samples for dictionary training
-    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    // Collect all blocks' packed data
+    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+
     for rb in 0..num_row_blocks {
         for cb in 0..num_col_blocks {
-            let mut block_data = Vec::new();
-            for r in (rb * BLOCK_SIZE)..std::cmp::min((rb + 1) * BLOCK_SIZE, num_right) {
-                let mut prev: i16 = 0;
-                for c in (cb * BLOCK_SIZE)..std::cmp::min((cb + 1) * BLOCK_SIZE, num_left) {
+            let row_start = rb * BLOCK_SIZE;
+            let row_end = std::cmp::min(row_start + BLOCK_SIZE, num_right);
+            let col_start = cb * BLOCK_SIZE;
+            let col_end = std::cmp::min(col_start + BLOCK_SIZE, num_left);
+            let actual_rows = row_end - row_start;
+            let actual_cols = col_end - col_start;
+            let num_cells = actual_rows * actual_cols;
+
+            // Read all values in this block
+            let mut values = Vec::with_capacity(num_cells);
+            let mut min_val: i16 = i16::MAX;
+            let mut max_val: i16 = i16::MIN;
+            for r in row_start..row_end {
+                for c in col_start..col_end {
                     let idx = r * num_left + c;
                     let pos = matrix_start + idx * 2;
                     let val = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
-                    if c == cb * BLOCK_SIZE {
-                        // First column: store as-is
-                        block_data.extend_from_slice(&val.to_le_bytes());
-                    } else {
-                        // Subsequent columns: store delta
-                        let delta = val.wrapping_sub(prev);
-                        block_data.extend_from_slice(&delta.to_le_bytes());
+                    values.push(val);
+                    if val < min_val {
+                        min_val = val;
                     }
-                    prev = val;
+                    if val > max_val {
+                        max_val = val;
+                    }
                 }
             }
-            samples.push(block_data);
+
+            // Compute bit width needed for (max - min)
+            let range = (max_val as i32 - min_val as i32) as u16;
+            let bit_width = compact::bits_needed(range);
+
+            // Pack values
+            let total_bits = num_cells * bit_width as usize;
+            let packed_bytes = (total_bits + 7) / 8;
+            let mut packed = vec![0u8; packed_bytes];
+
+            for (i, &val) in values.iter().enumerate() {
+                let offset_val = (val as i32 - min_val as i32) as u16;
+                compact::pack_bits(&mut packed, i * bit_width as usize, offset_val, bit_width);
+            }
+
+            // Build block: [min_val: i16][bit_width: u8][packed_data]
+            let mut block = Vec::with_capacity(3 + packed_bytes);
+            block.extend_from_slice(&min_val.to_le_bytes());
+            block.push(bit_width);
+            block.extend_from_slice(&packed);
+
+            block_data_vec.push(block);
         }
-    }
-
-    // Train dictionary from continuous buffer (more efficient than from_samples)
-    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
-    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
-    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
-        .expect("zstd dictionary training failed");
-    eprintln!("    Trained connection matrix dictionary: {} bytes", dict.len());
-
-    // Compress each block with the dictionary at level 19
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
-        .expect("failed to create compressor with dictionary");
-    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-    for sample in &samples {
-        let compressed = compressor.compress(sample)
-            .expect("zstd compression failed");
-        compressed_blocks.push(compressed);
     }
 
     // Build output
     let mut result = Vec::new();
-    result.extend_from_slice(&COMPRESSED_DELTA_MAGIC.to_le_bytes());
+    result.extend_from_slice(&BITPACKED_MAGIC.to_le_bytes());
     result.extend_from_slice(&(num_left as u16).to_le_bytes());
     result.extend_from_slice(&(num_right as u16).to_le_bytes());
     result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
 
-    // Dictionary
-    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
-    result.extend_from_slice(&dict);
-
-    // Build block index
+    // Build block offset table
     let mut data_offset: u32 = 0;
-    for block in &compressed_blocks {
+    for block in &block_data_vec {
         result.extend_from_slice(&data_offset.to_le_bytes());
-        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
         data_offset += block.len() as u32;
     }
 
-    // Write compressed data
-    for block in &compressed_blocks {
+    // Write block data
+    for block in &block_data_vec {
         result.extend_from_slice(block);
     }
 
@@ -308,33 +317,112 @@ fn build_marisa_section(entries: &[(Vec<u8>, u32)]) -> Vec<u8> {
 
 // ── Word infos block compression ────────────────────────────────────────
 
-const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
-const WI_BLOCK_SIZE: usize = 128;
+const VBYTE_WI_MAGIC: u32 = 0x4D57_5642; // "MWVB"
 
-/// Block-compress word_info records.
+/// Read a string-length field from the original word_info format (1-2 bytes).
+/// Returns (length_in_u16_code_units, bytes_consumed).
+fn read_string_length(buf: &[u8], pos: usize) -> (usize, usize) {
+    let first = buf[pos] as usize;
+    if first >= 128 {
+        let actual = ((first & 0x7f) << 8) | buf[pos + 1] as usize;
+        (actual, 2)
+    } else {
+        (first, 1)
+    }
+}
+
+/// VByte-encode a single word_info record.
 ///
-/// Groups N consecutive records into zstd-compressed blocks.
-/// A zstd dictionary is trained from all blocks for better compression.
+/// Reads the record from the original (standard) binary format and
+/// re-encodes integer/array fields with VByte encoding. String fields
+/// (surface, normalized_form, reading_form) retain their original
+/// UTF-16 encoding for compactness with CJK text.
+///
+/// Original format:
+///   surface(str) head_word_length(str_len) pos_id(u16)
+///   normalized_form(str) dict_form_word_id(i32) reading_form(str)
+///   a_split(u8+u32[]) b_split(u8+u32[]) word_struct(u8+u32[])
+///   [synonym_group_ids(u8+u32[])]
+///
+/// VByte format:
+///   surface(str) head_word_length(str_len) pos_id(vbyte_u16)
+///   normalized_form(str) dict_form_word_id(zigzag_vbyte) reading_form(str)
+///   a_split(vbyte+vbyte[]) b_split(vbyte+vbyte[]) word_struct(vbyte+vbyte[])
+///   [synonym_group_ids(vbyte+vbyte[])]
+fn vbyte_reencode_record(
+    record: &[u8],
+    has_synonym_group_ids: bool,
+    output: &mut Vec<u8>,
+) {
+    let mut pos = 0;
+
+    // surface: string → copy as-is
+    let (slen, slen_bytes) = read_string_length(record, pos);
+    let str_total = slen_bytes + slen * 2;
+    output.extend_from_slice(&record[pos..pos + str_total]);
+    pos += str_total;
+
+    // head_word_length: string_length format → copy as-is (already 1-2 bytes)
+    let (_, hwl_bytes) = read_string_length(record, pos);
+    output.extend_from_slice(&record[pos..pos + hwl_bytes]);
+    pos += hwl_bytes;
+
+    // pos_id: u16 → VByte
+    let pos_id = u16::from_le_bytes(record[pos..pos + 2].try_into().unwrap());
+    pos += 2;
+    compact::encode_vbyte(pos_id as u32, output);
+
+    // normalized_form: string → copy as-is
+    let (slen, slen_bytes) = read_string_length(record, pos);
+    let str_total = slen_bytes + slen * 2;
+    output.extend_from_slice(&record[pos..pos + str_total]);
+    pos += str_total;
+
+    // dictionary_form_word_id: i32 → zigzag + VByte
+    let dfw_id = i32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    compact::encode_vbyte(compact::encode_zigzag(dfw_id), output);
+
+    // reading_form: string → copy as-is
+    let (slen, slen_bytes) = read_string_length(record, pos);
+    let str_total = slen_bytes + slen * 2;
+    output.extend_from_slice(&record[pos..pos + str_total]);
+    pos += str_total;
+
+    // arrays: [u8 count][u32 × count] → [VByte count][VByte × count]
+    let num_arrays = if has_synonym_group_ids { 4 } else { 3 };
+    for _ in 0..num_arrays {
+        let count = record[pos] as usize;
+        pos += 1;
+        compact::encode_vbyte(count as u32, output);
+        for _ in 0..count {
+            let val = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            compact::encode_vbyte(val, output);
+        }
+    }
+}
+
+/// VByte-encode word_info records.
+///
+/// Re-encodes each record with VByte integer/array fields, stores them
+/// flat (no block compression), and builds a u32 offset table for
+/// direct random access.
+///
 /// Output format:
 /// ```text
-/// [MAGIC: u32]
+/// [MWVB_MAGIC: u32]
 /// [num_words: u32]
-/// [records_per_block: u16]
-/// [num_blocks: u32]
-/// [dict_size: u32]
-/// [dictionary: u8 × dict_size]
-/// [record_offsets: u32 × num_words]        — byte offset within decompressed block
-/// [block_index: (offset: u32, size: u32) × num_blocks]
-/// [compressed_block_data: ...]
+/// [data_size: u32]                        — total bytes of record data
+/// [record_offsets: u32 × num_words]       — byte offset within record data
+/// [record_data: ...]
 /// ```
-fn block_compress_word_infos(
+fn vbyte_encode_word_infos(
     buf: &[u8],
     word_infos_start: usize,
     num_words: usize,
+    has_synonym_group_ids: bool,
 ) -> Vec<u8> {
-    let records_per_block = WI_BLOCK_SIZE;
-    let num_blocks = (num_words + records_per_block - 1) / records_per_block;
-
     // Read original absolute offsets
     let mut orig_offsets = Vec::with_capacity(num_words);
     for i in 0..num_words {
@@ -343,75 +431,36 @@ fn block_compress_word_infos(
 
     let data_end = buf.len();
 
-    // First pass: collect raw blocks as samples and compute intra-block offsets
-    let mut record_offsets = vec![0u32; num_words];
-    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    // Re-encode each record
+    let mut record_data = Vec::new();
+    let mut record_offsets = Vec::with_capacity(num_words);
 
-    for block_idx in 0..num_blocks {
-        let start_word = block_idx * records_per_block;
-        let end_word = std::cmp::min(start_word + records_per_block, num_words);
-
-        let block_data_start = orig_offsets[start_word];
-        let block_data_end = if end_word < num_words {
-            orig_offsets[end_word]
+    for i in 0..num_words {
+        let rec_start = orig_offsets[i];
+        let rec_end = if i + 1 < num_words {
+            orig_offsets[i + 1]
         } else {
             data_end
         };
+        let record = &buf[rec_start..rec_end];
 
-        let block_data = &buf[block_data_start..block_data_end];
-
-        for i in start_word..end_word {
-            record_offsets[i] = (orig_offsets[i] - block_data_start) as u32;
-        }
-
-        samples.push(block_data.to_vec());
-    }
-
-    // Train dictionary from continuous buffer (more efficient than from_samples)
-    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
-    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
-    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
-        .expect("zstd dictionary training failed");
-    eprintln!("    Trained word_infos dictionary: {} bytes", dict.len());
-
-    // Compress each block with the dictionary at level 19
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)
-        .expect("failed to create compressor with dictionary");
-    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-    for sample in &samples {
-        let compressed = compressor.compress(sample)
-            .expect("zstd compression failed");
-        compressed_blocks.push(compressed);
+        record_offsets.push(record_data.len() as u32);
+        vbyte_reencode_record(record, has_synonym_group_ids, &mut record_data);
     }
 
     // Build output
     let mut result = Vec::new();
-    result.extend_from_slice(&BLOCK_WI_MAGIC.to_le_bytes());
+    result.extend_from_slice(&VBYTE_WI_MAGIC.to_le_bytes());
     result.extend_from_slice(&(num_words as u32).to_le_bytes());
-    result.extend_from_slice(&(records_per_block as u16).to_le_bytes());
-    result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    result.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
 
-    // Dictionary
-    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
-    result.extend_from_slice(&dict);
-
-    // Record offsets (intra-block)
+    // Record offsets
     for &off in &record_offsets {
         result.extend_from_slice(&off.to_le_bytes());
     }
 
-    // Block index
-    let mut data_offset: u32 = 0;
-    for block in &compressed_blocks {
-        result.extend_from_slice(&data_offset.to_le_bytes());
-        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
-        data_offset += block.len() as u32;
-    }
-
-    // Compressed data
-    for block in &compressed_blocks {
-        result.extend_from_slice(block);
-    }
+    // Record data
+    result.extend_from_slice(&record_data);
 
     result
 }
@@ -774,16 +823,16 @@ fn main() {
             );
         }
 
-        // Compress and write connection matrix
+        // Bit-pack and write connection matrix
         let original_matrix_size = (matrix_end - matrix_start) as f64;
-        let compressed = compress_connection_matrix(&buf, matrix_start, left_id, right_id);
+        let bitpacked = bitpack_connection_matrix(&buf, matrix_start, left_id, right_id);
         eprintln!(
-            "  Connection matrix: {:.1} MB → {:.1} MB ({:.1}x compression)",
+            "  Connection matrix: {:.1} MB → {:.1} MB ({:.1}x ratio, bit-packed)",
             original_matrix_size / 1024.0 / 1024.0,
-            compressed.len() as f64 / 1024.0 / 1024.0,
-            original_matrix_size / compressed.len() as f64
+            bitpacked.len() as f64 / 1024.0 / 1024.0,
+            original_matrix_size / bitpacked.len() as f64
         );
-        output.extend_from_slice(&compressed);
+        output.extend_from_slice(&bitpacked);
 
         lexicon_offset = matrix_end;
     } else {
@@ -847,19 +896,19 @@ fn main() {
     }
     post_offset = wp_end;
 
-    // ── 5. Block-compressed word infos ─────────────────────────────
+    // ── 5. VByte-encoded word infos ──────────────────────────────────
     let word_infos_start = post_offset;
     let original_wi_size = buf.len() - word_infos_start;
+    let has_synonym_group_ids_flag = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
 
-    let compressed_wi = block_compress_word_infos(&buf, word_infos_start, word_params_size);
+    let vbyte_wi = vbyte_encode_word_infos(&buf, word_infos_start, word_params_size, has_synonym_group_ids_flag);
     eprintln!(
-        "  Word infos: {:.1} MB → {:.1} MB ({:.1}x compression, {}-record blocks)",
+        "  Word infos: {:.1} MB → {:.1} MB ({:.1}x ratio, VByte-encoded)",
         original_wi_size as f64 / 1024.0 / 1024.0,
-        compressed_wi.len() as f64 / 1024.0 / 1024.0,
-        original_wi_size as f64 / compressed_wi.len() as f64,
-        WI_BLOCK_SIZE,
+        vbyte_wi.len() as f64 / 1024.0 / 1024.0,
+        original_wi_size as f64 / vbyte_wi.len() as f64,
     );
-    output.extend_from_slice(&compressed_wi);
+    output.extend_from_slice(&vbyte_wi);
 
     // ── 6. Swap trie + word_id table to reading-keyed (KKC only) ──────
     //
