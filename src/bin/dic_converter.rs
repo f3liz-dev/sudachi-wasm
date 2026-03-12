@@ -1,9 +1,9 @@
-//! Dictionary converter: YADA → MARISA with mixed compression.
+//! Dictionary converter: YADA → MARISA with zstd compression.
 //!
 //! Reads a standard Sudachi `.dic` file and writes a new `.dic` file with:
 //! 1. MARISA trie index (replacing YADA double-array trie)
 //! 2. Block-compressed connection matrix (zstd, 256×256 blocks)
-//! 3. VByte-encoded word_infos (variable-byte integer/array fields)
+//! 3. Block-compressed word_infos (zstd, 128-record blocks)
 //!
 //! Usage:
 //!   dic_converter <input.dic> <output.dic>
@@ -16,7 +16,6 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process;
 
-use sudachi::dic::compact;
 #[cfg(not(target_arch = "wasm32"))]
 use zstd::bulk;
 
@@ -103,6 +102,38 @@ fn parse_grammar(buf: &[u8], grammar_offset: usize) -> (Vec<u8>, usize, usize, u
     (pos_list_bytes, left_id, right_id, matrix_start, matrix_end)
 }
 
+fn train_zstd_dictionary(samples: &[Vec<u8>], label: &str) -> Vec<u8> {
+    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
+    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
+    match zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024) {
+        Ok(dict) => {
+            eprintln!("    Trained {} dictionary: {} bytes", label, dict.len());
+            dict
+        }
+        Err(err) => {
+            eprintln!("    Skipping {} dictionary training: {}", label, err);
+            Vec::new()
+        }
+    }
+}
+
+fn compress_zstd_samples(samples: &[Vec<u8>], dict: &[u8]) -> Vec<Vec<u8>> {
+    if dict.is_empty() {
+        let mut compressor = bulk::Compressor::new(19).expect("failed to create zstd compressor");
+        samples
+            .iter()
+            .map(|sample| compressor.compress(sample).expect("zstd compression failed"))
+            .collect()
+    } else {
+        let mut compressor = bulk::Compressor::with_dictionary(19, dict)
+            .expect("failed to create compressor with dictionary");
+        samples
+            .iter()
+            .map(|sample| compressor.compress(sample).expect("zstd compression failed"))
+            .collect()
+    }
+}
+
 /// Compress the connection matrix into 256×256 zstd blocks.
 ///
 /// Raw i16 matrix cells are grouped into blocks, a zstd dictionary is trained
@@ -145,24 +176,8 @@ fn compress_connection_matrix(
         }
     }
 
-    let sample_sizes: Vec<usize> = samples.iter().map(|s| s.len()).collect();
-    let continuous: Vec<u8> = samples.iter().flat_map(|s| s.iter().copied()).collect();
-    let dict = zstd::dict::from_continuous(&continuous, &sample_sizes, 256 * 1024)
-        .expect("zstd dictionary training failed");
-    eprintln!(
-        "    Trained connection matrix dictionary: {} bytes",
-        dict.len()
-    );
-
-    let mut compressor = bulk::Compressor::with_dictionary(19, &dict)
-        .expect("failed to create compressor with dictionary");
-    let mut compressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-    for sample in &samples {
-        let compressed = compressor
-            .compress(sample)
-            .expect("zstd compression failed");
-        compressed_blocks.push(compressed);
-    }
+    let dict = train_zstd_dictionary(&samples, "connection matrix");
+    let compressed_blocks = compress_zstd_samples(&samples, &dict);
 
     let mut result = Vec::new();
     result.extend_from_slice(&COMPRESSED_MAGIC.to_le_bytes());
@@ -287,146 +302,84 @@ fn build_marisa_section(entries: &[(Vec<u8>, u32)]) -> Vec<u8> {
 
 // ── Word infos block compression ────────────────────────────────────────
 
-const VBYTE_WI_MAGIC: u32 = 0x4D57_5642; // "MWVB"
+const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
+const WI_BLOCK_SIZE: usize = 128;
 
-/// Read a string-length field from the original word_info format (1-2 bytes).
-/// Returns (length_in_u16_code_units, bytes_consumed).
-fn read_string_length(buf: &[u8], pos: usize) -> (usize, usize) {
-    let first = buf[pos] as usize;
-    if first >= 128 {
-        let actual = ((first & 0x7f) << 8) | buf[pos + 1] as usize;
-        (actual, 2)
-    } else {
-        (first, 1)
-    }
-}
-
-/// VByte-encode a single word_info record.
+/// Block-compress word_info records with zstd.
 ///
-/// Reads the record from the original (standard) binary format and
-/// re-encodes integer/array fields with VByte encoding. String fields
-/// (surface, normalized_form, reading_form) retain their original
-/// UTF-16 encoding for compactness with CJK text.
-///
-/// Original format:
-///   surface(str) head_word_length(str_len) pos_id(u16)
-///   normalized_form(str) dict_form_word_id(i32) reading_form(str)
-///   a_split(u8+u32[]) b_split(u8+u32[]) word_struct(u8+u32[])
-///   [synonym_group_ids(u8+u32[])]
-///
-/// VByte format:
-///   surface(str) head_word_length(str_len) pos_id(vbyte_u16)
-///   normalized_form(str) dict_form_word_id(zigzag_vbyte) reading_form(str)
-///   a_split(vbyte+vbyte[]) b_split(vbyte+vbyte[]) word_struct(vbyte+vbyte[])
-///   [synonym_group_ids(vbyte+vbyte[])]
-fn vbyte_reencode_record(record: &[u8], has_synonym_group_ids: bool, output: &mut Vec<u8>) {
-    let mut pos = 0;
-
-    // surface: string → copy as-is
-    let (slen, slen_bytes) = read_string_length(record, pos);
-    let str_total = slen_bytes + slen * 2;
-    output.extend_from_slice(&record[pos..pos + str_total]);
-    pos += str_total;
-
-    // head_word_length: string_length format → copy as-is (already 1-2 bytes)
-    let (_, hwl_bytes) = read_string_length(record, pos);
-    output.extend_from_slice(&record[pos..pos + hwl_bytes]);
-    pos += hwl_bytes;
-
-    // pos_id: u16 → VByte
-    let pos_id = u16::from_le_bytes(record[pos..pos + 2].try_into().unwrap());
-    pos += 2;
-    compact::encode_vbyte(pos_id as u32, output);
-
-    // normalized_form: string → copy as-is
-    let (slen, slen_bytes) = read_string_length(record, pos);
-    let str_total = slen_bytes + slen * 2;
-    output.extend_from_slice(&record[pos..pos + str_total]);
-    pos += str_total;
-
-    // dictionary_form_word_id: i32 → zigzag + VByte
-    let dfw_id = i32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
-    pos += 4;
-    compact::encode_vbyte(compact::encode_zigzag(dfw_id), output);
-
-    // reading_form: string → copy as-is
-    let (slen, slen_bytes) = read_string_length(record, pos);
-    let str_total = slen_bytes + slen * 2;
-    output.extend_from_slice(&record[pos..pos + str_total]);
-    pos += str_total;
-
-    // arrays: [u8 count][u32 × count] → [VByte count][VByte × count]
-    let num_arrays = if has_synonym_group_ids { 4 } else { 3 };
-    for _ in 0..num_arrays {
-        let count = record[pos] as usize;
-        pos += 1;
-        compact::encode_vbyte(count as u32, output);
-        for _ in 0..count {
-            let val = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            compact::encode_vbyte(val, output);
-        }
-    }
-}
-
-/// VByte-encode word_info records.
-///
-/// Re-encodes each record with VByte integer/array fields, stores them
-/// flat (no block compression), and builds a u32 offset table for
-/// direct random access.
+/// Groups consecutive records into independently compressed blocks and
+/// stores per-record intra-block offsets for direct lookup.
 ///
 /// Output format:
 /// ```text
-/// [MWVB_MAGIC: u32]
+/// [MAGIC: u32]
 /// [num_words: u32]
-/// [data_size: u32]                        — total bytes of record data
-/// [record_offsets: u32 × num_words]       — byte offset within record data
-/// [record_data: ...]
+/// [records_per_block: u16]
+/// [num_blocks: u32]
+/// [dict_size: u32]
+/// [dictionary: u8 × dict_size]
+/// [record_offsets: u32 × num_words]        — byte offset within decompressed block
+/// [block_index: (offset: u32, size: u32) × num_blocks]
+/// [compressed_block_data: ...]
 /// ```
-fn vbyte_encode_word_infos(
-    buf: &[u8],
-    word_infos_start: usize,
-    num_words: usize,
-    has_synonym_group_ids: bool,
-) -> Vec<u8> {
-    // Read original absolute offsets
+fn block_compress_word_infos(buf: &[u8], word_infos_start: usize, num_words: usize) -> Vec<u8> {
+    let records_per_block = WI_BLOCK_SIZE;
+    let num_blocks = num_words.div_ceil(records_per_block);
+
     let mut orig_offsets = Vec::with_capacity(num_words);
     for i in 0..num_words {
         orig_offsets.push(read_u32_le(buf, word_infos_start + i * 4) as usize);
     }
 
     let data_end = buf.len();
+    let mut record_offsets = vec![0u32; num_words];
+    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
 
-    // Re-encode each record
-    let mut record_data = Vec::new();
-    let mut record_offsets = Vec::with_capacity(num_words);
+    for block_idx in 0..num_blocks {
+        let start_word = block_idx * records_per_block;
+        let end_word = std::cmp::min(start_word + records_per_block, num_words);
 
-    for i in 0..num_words {
-        let rec_start = orig_offsets[i];
-        let rec_end = if i + 1 < num_words {
-            orig_offsets[i + 1]
+        let block_data_start = orig_offsets[start_word];
+        let block_data_end = if end_word < num_words {
+            orig_offsets[end_word]
         } else {
             data_end
         };
-        let record = &buf[rec_start..rec_end];
 
-        record_offsets.push(record_data.len() as u32);
-        vbyte_reencode_record(record, has_synonym_group_ids, &mut record_data);
+        let block_data = &buf[block_data_start..block_data_end];
+
+        for i in start_word..end_word {
+            record_offsets[i] = (orig_offsets[i] - block_data_start) as u32;
+        }
+
+        samples.push(block_data.to_vec());
     }
 
-    // Build output
-    let mut result = Vec::new();
-    result.extend_from_slice(&VBYTE_WI_MAGIC.to_le_bytes());
-    result.extend_from_slice(&(num_words as u32).to_le_bytes());
-    result.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
+    let dict = train_zstd_dictionary(&samples, "word_infos");
+    let compressed_blocks = compress_zstd_samples(&samples, &dict);
 
-    // Record offsets
+    let mut result = Vec::new();
+    result.extend_from_slice(&BLOCK_WI_MAGIC.to_le_bytes());
+    result.extend_from_slice(&(num_words as u32).to_le_bytes());
+    result.extend_from_slice(&(records_per_block as u16).to_le_bytes());
+    result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    result.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    result.extend_from_slice(&dict);
+
     for &off in &record_offsets {
         result.extend_from_slice(&off.to_le_bytes());
     }
 
-    // Record data
-    result.extend_from_slice(&record_data);
+    let mut data_offset: u32 = 0;
+    for block in &compressed_blocks {
+        result.extend_from_slice(&data_offset.to_le_bytes());
+        result.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        data_offset += block.len() as u32;
+    }
+
+    for block in &compressed_blocks {
+        result.extend_from_slice(block);
+    }
 
     result
 }
@@ -705,7 +658,7 @@ fn main() {
     if args.len() < 3 {
         eprintln!("Usage: {} <input.dic> <output.dic> [--cost-csv <adjusted.csv>] [--matrix-patches <patches.csv>] [--reading-keyed]", args[0]);
         eprintln!("Converts a YADA-format Sudachi dictionary to MARISA-format");
-        eprintln!("with a zstd-compressed connection matrix and VByte-encoded word infos.");
+        eprintln!("with a zstd-compressed connection matrix and zstd-compressed word infos.");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --cost-csv <path>        Apply Julia-optimized costs from CSV");
@@ -866,24 +819,19 @@ fn main() {
     }
     post_offset = wp_end;
 
-    // ── 5. VByte-encoded word infos ──────────────────────────────────
+    // ── 5. Block-compressed word infos ───────────────────────────────
     let word_infos_start = post_offset;
     let original_wi_size = buf.len() - word_infos_start;
-    let has_synonym_group_ids_flag = version == SYSTEM_DICT_V2 || version == USER_DICT_V3;
 
-    let vbyte_wi = vbyte_encode_word_infos(
-        &buf,
-        word_infos_start,
-        word_params_size,
-        has_synonym_group_ids_flag,
-    );
+    let compressed_wi = block_compress_word_infos(&buf, word_infos_start, word_params_size);
     eprintln!(
-        "  Word infos: {:.1} MB → {:.1} MB ({:.1}x ratio, VByte-encoded)",
+        "  Word infos: {:.1} MB → {:.1} MB ({:.1}x ratio, zstd, {}-record blocks)",
         original_wi_size as f64 / 1024.0 / 1024.0,
-        vbyte_wi.len() as f64 / 1024.0 / 1024.0,
-        original_wi_size as f64 / vbyte_wi.len() as f64,
+        compressed_wi.len() as f64 / 1024.0 / 1024.0,
+        original_wi_size as f64 / compressed_wi.len() as f64,
+        WI_BLOCK_SIZE,
     );
-    output.extend_from_slice(&vbyte_wi);
+    output.extend_from_slice(&compressed_wi);
 
     // ── 6. Swap trie + word_id table to reading-keyed (KKC only) ──────
     //
