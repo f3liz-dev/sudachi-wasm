@@ -297,11 +297,28 @@
       const initialVariant = document.getElementById("dict").value;
       await loadDict(initialVariant);
       
-      // Set up Paste+Analyze button
+      // Set up Paste+Analyze button - accepts plain text only
       document.getElementById("paste-analyze-btn").addEventListener("click", async () => {
         try {
-          const text = await navigator.clipboard.readText();
-          document.getElementById("text").value = text;
+          // Read clipboard items to access plain text directly
+          const clipboardItems = await navigator.clipboard.read();
+          let plainText = '';
+          
+          for (const item of clipboardItems) {
+            // Look for plain text only, ignore HTML/rich text formats
+            if (item.types.includes('text/plain')) {
+              const blob = await item.getType('text/plain');
+              plainText = await blob.text();
+              break;
+            }
+          }
+          
+          if (!plainText) {
+            // Fallback to readText if read() doesn't work
+            plainText = await navigator.clipboard.readText();
+          }
+          
+          document.getElementById("text").value = plainText.trim();
           analyze();
         } catch (err) {
           setStatus(`❌ Failed to paste from clipboard: ${err.message}`);
