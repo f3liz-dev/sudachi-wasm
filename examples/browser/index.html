@@ -7,6 +7,7 @@
     body { font-family: sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
     h1   { font-size: 1.4rem; }
     .controls { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
+    .left-buttons { display: flex; flex-direction: column; gap: .5rem; }
     input[type=text] { flex: 1; font-size: 1rem; padding: .3rem .5rem; }
     select, button   { font-size: 1rem; padding: .3rem .6rem; }
     #status { color: #666; font-style: italic; margin-bottom: .4rem; }
@@ -47,6 +48,10 @@
   <div id="progress-wrap"><div id="progress-bar"></div></div>
 
   <div class="controls">
+    <div class="left-buttons">
+      <button id="paste-analyze-btn" disabled>Paste+Analyze</button>
+      <button id="copy-btn">Copy</button>
+    </div>
     <input id="text" type="text" value="今日はいい天気ですね。" />
     <select id="dict" title="Dictionary">
       <option value="small">Small dict</option>
@@ -284,12 +289,63 @@
       loadedDictVariant = variant;
       setStatus(`✅ Ready (${label} dictionary)`);
       document.getElementById("btn").disabled = false;
+      document.getElementById("paste-analyze-btn").disabled = false;
     }
 
     async function setup() {
       await init();
       const initialVariant = document.getElementById("dict").value;
       await loadDict(initialVariant);
+      
+      // Set up Paste+Analyze button
+      document.getElementById("paste-analyze-btn").addEventListener("click", async () => {
+        try {
+          const text = await navigator.clipboard.readText();
+          document.getElementById("text").value = text;
+          analyze();
+        } catch (err) {
+          setStatus(`❌ Failed to paste from clipboard: ${err.message}`);
+        }
+      });
+      
+      // Set up Copy button - copies furigana output in text format
+      document.getElementById("copy-btn").addEventListener("click", async () => {
+        if (!lastMorphemes) {
+          setStatus("❌ No output to copy. Please analyze some text first.");
+          return;
+        }
+        
+        // Generate text format: 漢字(よみ)
+        const textOutput = lastMorphemes.map((m) => {
+          const surface = m.surface;
+          const reading = katakanaToHiragana(m.readingForm);
+
+          // No kanji or reading identical to surface — plain text
+          if (!containsKanji(surface) || reading === surface) {
+            return surface;
+          }
+
+          try {
+            const segs = alignFurigana(surface, reading);
+            return renderSegments(segs, "text");
+          } catch (e) {
+            return `${surface}(${reading})`;
+          }
+        }).join("");
+        
+        try {
+          await navigator.clipboard.writeText(textOutput);
+          setStatus("✅ Copied furigana output to clipboard!");
+          setTimeout(() => {
+            if (loadedDictVariant) {
+              const label = { small: "Small", core: "Core", full: "Full" }[loadedDictVariant];
+              setStatus(`✅ Ready (${label} dictionary)`);
+            }
+          }, 2000);
+        } catch (err) {
+          setStatus(`❌ Failed to copy to clipboard: ${err.message}`);
+        }
+      });
     }
 
     // Reload tokenizer when dictionary selector changes
